@@ -4,7 +4,7 @@
  * PROVIDER REGISTRY
  * =================
  * AUDIO_PROVIDER env degiskeni ile saglayici secilir:
- *   suno | replicate | google | elevenlabs | mock
+ *   suno | replicate | google | gemini-web | elevenlabs | mock
  *
  * Varsayilan: suno
  *
@@ -16,6 +16,7 @@ const providers = {
   suno: require('./suno'),
   replicate: require('./replicate'),
   google: require('./google'),
+  'gemini-web': require('./gemini-web'),
   elevenlabs: require('./elevenlabs'),
   mock: require('./mock'),
 };

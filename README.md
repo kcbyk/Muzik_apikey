@@ -1615,3 +1615,38 @@ GET /stream/:id → 200 inline audio/mpeg
 
 Lyria 3.5 ≈ **$0.08 / şarkı** (Gemini API fiyatlandırması). Anahtar:
 https://aistudio.google.com/apikey
+
+---
+
+## 30. 🌐 `gemini-web` sağlayıcısı (deneysel, çerez tabanlı)
+
+### 30.1 Mantık
+
+Suno ile aynı: kullanıcının **kendi oturum çerezleri** + sitenin iç RPC'si.
+Gemini web'de Lyria ücretsiz ve MP3 indirmeye izin veriyor; resmî API ise ücretli
+($0.04 / 30 sn, $0.08 / tam şarkı). Bu sağlayıcı aradaki farkı kapatır.
+
+```text
+AUDIO_PROVIDER=gemini-web
+GEMINI_WEB_COOKIES=__Secure-1PSID=...; __Secure-1PSIDTS=...; ...
+```
+
+### 30.2 İki mod
+
+| Mod | Nasıl | Güvenilirlik |
+|---|---|---|
+| **Şablon (önerilen)** | `GEMINI_WEB_REQUEST_TEMPLATE=/path/req.json` | Gerçek isteği birebir tekrarlar |
+| Genel | XSRF (`SNlM0e`) alıp StreamGenerate dener | Payload değişince kırılabilir |
+
+### 30.3 Bilinen riskler
+
+1. Resmî olmayan uç — Google haber vermeden değiştirebilir.
+2. `__Secure-1PSIDTS` birkaç dakikada bir döner → oturum düşebilir.
+3. Google Kullanım Şartları'na aykırı olabilir (kendi hesabın, kendi riskin).
+4. Hızlı isteklerde 429 / captcha.
+
+### 30.4 Ses nereden geliyor
+
+Cevap içinden base64 (`ID3`/`RIFF` imzası) veya `googleusercontent.com` ses URL'si
+çıkarılır; baytlar belleğe alınır ve **kendi indirme sistemimizden** servis edilir
+(`/download?id=…`, `Range` destekli). Dışarıya URL sızdırılmaz.
