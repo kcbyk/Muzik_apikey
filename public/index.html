@@ -485,8 +485,8 @@
 
       const dur = c.duration ? `${Math.round(c.duration)} sn` : '—';
       const ready = c.status === 'complete';
-      // Buton yalnizca klip tamamlandi VE sunucu "indirme hazir" dediyse aktif.
-      const canDownload = ready && c.download_ready === true;
+      // Klip tamamlandiysa indirme dogrudan aktif.
+      const canDownload = ready && c.download_ready !== false;
 
       el.innerHTML = `
         <div class="clip-top">
@@ -499,7 +499,7 @@
         ${ready ? '<audio controls preload="none"></audio>' : ''}
         <div class="clip-actions">
           ${ready ? '<a class="btn btn-ghost btn-sm" download>⬇ MP3 indir</a>' : ''}
-          ${ready && c.download_ready !== true ? '<span class="hint" data-dlmsg></span>' : ''}
+          ${ready && c.download_ready === false ? '<span class="hint" data-dlmsg></span>' : ''}
           <button class="btn btn-ghost btn-sm" data-act="refresh">↻ Durum</button>
           <button class="btn btn-ghost btn-sm" data-act="remove">✕ Kaldır</button>
         </div>

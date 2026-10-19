@@ -39,6 +39,7 @@ const providerRegistry = require('./providers');
 const signer = require('./utils/signer');
 const { SignerPool } = require('./utils/signerPool');
 const { KeyStore } = require('./utils/keyStore');
+const mangoDecrypter = require('./utils/mangoDecrypter');
 
 // ============================================================================
 // 1. KONFIGURASYON
@@ -130,7 +131,7 @@ const CONFIG = {
   // Yalnizca bu host'lardan akis yapilir. "*" KULLANMAYIN.
   downloadAllowedHosts: (
     process.env.DOWNLOAD_ALLOWED_HOSTS ||
-    'audiopipe.suno.ai,cdn1.suno.ai,cdn2.suno.ai,cdn.suno.ai,studio-api-prod.suno.com,studio-api.prod.suno.com,suno-data-uploads.s3.amazonaws.com,replicate.delivery,pbxt.replicate.delivery'
+    'audiopipe.suno.ai,cdn1.suno.ai,cdn2.suno.ai,cdn.suno.ai,studio-api-prod.suno.com,studio-api.prod.suno.com,suno-data-uploads.s3.amazonaws.com,cloudfront.net,replicate.delivery,pbxt.replicate.delivery'
   )
     .split(',')
     .map((h) => h.trim().toLowerCase())
@@ -656,7 +657,7 @@ function parseRangeHeader(header, totalSize) {
  * Tum kaynaklari (upstream stream + ffmpeg subprocess) guvenli sekilde kapatir.
  * Idempotent: birden fazla kez cagrilabilir (close + error ayni anda gelebilir).
  */
-function makeCleanup(upstreamStream, proc) {
+function makeCleanup(upstreamStream, proc, decipher) {
   let done = false;
   return function cleanup() {
     if (done) return;
@@ -664,6 +665,10 @@ function makeCleanup(upstreamStream, proc) {
 
     try {
       if (upstreamStream && !upstreamStream.destroyed) upstreamStream.destroy();
+    } catch (_e) {}
+
+    try {
+      if (decipher && !decipher.destroyed) decipher.destroy();
     } catch (_e) {}
 
     if (proc && proc.exitCode === null && !proc.killed) {
@@ -821,10 +826,54 @@ async function pipeAudioStream(req, res, opts) {
   const upstreamType = String(upstream.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
   const looksAudio = upstreamType.startsWith('audio/') || upstreamType === 'application/octet-stream';
 
+  // --- Ilk bayt teshisi ve Mango DRM sifre cozme ---
+  const peeked = await peekFirstChunk(upstream.data, 8000);
+  if (peeked === null) {
+    upstream.data.destroy();
+    res.setHeader('X-Upstream-Status', `${upstream.status}-empty`);
+    return sendError(res, 502, 'UPSTREAM_EMPTY', 'Upstream baglandi fakat hic bayt gondermedi.');
+  }
+  if (peeked === undefined) {
+    upstream.data.destroy();
+    res.setHeader('X-Upstream-Status', `${upstream.status}-stalled`);
+    return sendError(res, 504, 'UPSTREAM_STALLED', 'Upstream baglandi fakat 8 saniye icinde veri gondermedi.');
+  }
+
+  let audioSourceStream = upstream.data;
+  let decipher = null;
+  const targetClipId = opts.clipId || (req.params && req.params.id) || (req.query && req.query.id);
+
+  if (!isPlainAudioHeader(peeked) && targetClipId) {
+    log('info', 'Sifreli ses akisi (Mango DRM) tespit edildi, sifre cozuluyor...', { clipId: targetClipId });
+    try {
+      decipher = await mangoDecrypter.createDecipher(targetClipId);
+      if (decipher) {
+        log('info', 'Mango decipher basariyla olusturuldu.');
+        audioSourceStream = upstream.data.pipe(decipher);
+        willTranscode = true; // Sifresi cozulmus sesin her cihazda calismasi icin MP3 transcode yap
+      }
+    } catch (decErr) {
+      log('warn', 'Mango decipher olusturulamadi.', sanitizeMessage(decErr.message));
+    }
+  }
+
+  if (!decipher && !isPlainAudioHeader(peeked)) {
+    upstream.data.destroy();
+    return sendError(
+      res,
+      409,
+      'CLIP_ENCRYPTED',
+      'Bu klip sifreli (DRM) akis donduruyor; cozulmemis baytlar istemciye gonderilmedi.',
+      `first_bytes=${Buffer.from(peeked.subarray(0, 8)).toString('hex')}`,
+    );
+  }
+
   let proc = null;
   let willTranscode = false;
 
-  if (transcode && CONFIG.enableTranscode) {
+  if (decipher) {
+    willTranscode = true;
+  } else if (transcode && CONFIG.enableTranscode) {
     if (!looksAudio) {
       // Ses olmayan bir govdeyi ffmpeg'e vermek anlamsiz (JSON hata vb.)
       log('warn', 'Upstream ses degil, transcode atlandi.', { upstreamType });
@@ -843,7 +892,7 @@ async function pipeAudioStream(req, res, opts) {
 
     proc = spawn(ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
 
-    const cleanup = makeCleanup(upstream.data, proc);
+    const cleanup = makeCleanup(upstream.data, proc, decipher);
 
     // ffmpeg stderr'ini topla (hata teshisi icin, max 2 KB)
     let stderrTail = '';
@@ -869,24 +918,24 @@ async function pipeAudioStream(req, res, opts) {
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.setHeader('Access-Control-Allow-Origin', req.get('origin') || '*');
     res.setHeader(
-    'Access-Control-Expose-Headers',
-    'Content-Type, Content-Disposition, Content-Length, Content-Range, Accept-Ranges, X-Transcode, X-Download-Mode',
-  );
-  // Ses calarin seek edebilmesi icin Range destegi oldugunu bildir.
-  if (!res.getHeader('Accept-Ranges')) res.setHeader('Accept-Ranges', 'bytes');
+      'Access-Control-Expose-Headers',
+      'Content-Type, Content-Disposition, Content-Length, Content-Range, Accept-Ranges, X-Transcode, X-Download-Mode',
+    );
+    // Ses calarin seek edebilmesi icin Range destegi oldugunu bildir.
+    if (!res.getHeader('Accept-Ranges')) res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('X-Transcode', `ffmpeg:${format}`);
     res.setHeader('X-Proxy-Mode', proxyMode);
     res.setHeader('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename="${safeName}"`);
 
-    // Upstream -> ffmpeg.stdin (backpressure pipe ile otomatik)
-    upstream.data.on('error', (e) => {
+    // Upstream (veya decipher) -> ffmpeg.stdin (backpressure pipe ile otomatik)
+    audioSourceStream.on('error', (e) => {
       log('warn', 'Upstream akis hatasi (transcode).', sanitizeMessage(e.message));
       cleanup();
       if (!res.headersSent) sendError(res, 502, 'STREAM_ERROR', 'Kaynak akis hatasi.');
       else res.destroy();
     });
 
-    upstream.data.pipe(proc.stdin);
+    audioSourceStream.pipe(proc.stdin);
     proc.stdin.on('error', () => {
       /* upstream kapandi - yut */
     });
@@ -919,8 +968,8 @@ async function pipeAudioStream(req, res, opts) {
   const rawLength = upstream.headers['content-length'];
   const totalSize = rawLength !== undefined ? Number.parseInt(rawLength, 10) : NaN;
 
-  const cleanup = makeCleanup(upstream.data, null);
-  upstream.data.on('error', (e) => {
+  const cleanup = makeCleanup(upstream.data, null, decipher);
+  audioSourceStream.on('error', (e) => {
     log('warn', 'Upstream akis hatasi (passthrough).', sanitizeMessage(e.message));
     cleanup();
     if (!res.headersSent) sendError(res, 502, 'STREAM_ERROR', 'Kaynak akis hatasi.');
@@ -980,7 +1029,7 @@ async function pipeAudioStream(req, res, opts) {
       slicer.destroy();
     });
 
-    upstream.data.pipe(slicer).pipe(res);
+    audioSourceStream.pipe(slicer).pipe(res);
     return;
   }
 
@@ -991,57 +1040,7 @@ async function pipeAudioStream(req, res, opts) {
   }
 
   // 3) Range yok -> tam govde
-  //    Header gondermeden once ilk chunk'i dikizle: bos yaniti temiz raporlayalim.
-  const peeked = await peekFirstChunk(upstream.data, 8000);
-
-  if (peeked === null) {
-    cleanup();
-    res.setHeader('X-Upstream-Status', `${upstream.status}-empty`);
-    return sendError(
-      res,
-      502,
-      'UPSTREAM_EMPTY',
-      'Upstream baglandi (200) fakat hic bayt gondermedi.',
-      `upstream_status=${upstream.status} content_type=${upstream.headers['content-type'] || '-'} ` +
-        `content_length=${declaredLength ?? 'yok'} ` +
-        `headers_forwarded=[UA, Accept-Language, Origin, Referer, Browser-Token, Device-Id, Cookie] ` +
-        `range_forwarded=${Boolean(req.headers.range)} — ` +
-        `upstream 200 + bos govde dondurdu; bu istemci header'larindan bagimsiz olabilir ` +
-        `(bkz. GET /debug/stream/${req.params.id || '<id>'} A/B testi)`,
-    );
-  }
-
-  if (peeked === undefined) {
-    cleanup();
-    res.setHeader('X-Upstream-Status', `${upstream.status}-stalled`);
-    return sendError(
-      res,
-      504,
-      'UPSTREAM_STALLED',
-      'Upstream baglandi fakat 8 saniye icinde veri gondermedi.',
-      `upstream_status=${upstream.status} content_type=${upstream.headers['content-type'] || '-'}`,
-    );
-  }
-
-  // --- Sifreli (DRM) govde tespiti -----------------------------------------
-  // Suno'nun audiopipe/CDN govdesi AES sifreli gelebilir: ilk baytlarda ID3,
-  // RIFF, fLaC, OggS veya mp3 frame sync yoktur ve entropi ~8 bit/bayttir.
-  // Boyle bir govdeyi istemciye "ses" diye gondermek yerine ACIKCA soyluyoruz.
-  if (!isPlainAudioHeader(peeked)) {
-    cleanup();
-    return sendError(
-      res,
-      409,
-      'CLIP_ENCRYPTED',
-      'Bu klip sifreli (DRM) akis donduruyor; cozulmemis baytlar istemciye gonderilmedi. ' +
-        'Indirme hakkina sahip kliplerde resmi indirme ucu (X-Download-Mode: official-api) duz MP3 verir.',
-      `upstream_status=${upstream.status} content_type=${upstream.headers['content-type'] || '-'} ` +
-        `first_bytes=${peeked ? Buffer.from(peeked.subarray(0, 8)).toString('hex') : '-'} ` +
-        `cozulmemis ses almak icin: /debug/stream/:id (teshis) — sifre cozme kapsam disidir.`,
-    );
-  }
-
-  if (rawLength) res.setHeader('Content-Length', rawLength);
+  if (rawLength && !decipher) res.setHeader('Content-Length', rawLength);
   res.status(200);
 
   const counter = new ByteCounterTransform();
@@ -1074,7 +1073,7 @@ async function pipeAudioStream(req, res, opts) {
     counter.destroy();
   });
 
-  upstream.data.pipe(counter).pipe(res);
+  audioSourceStream.pipe(counter).pipe(res);
 }
 
 /**
@@ -1721,6 +1720,16 @@ async function resolveAudioSource(clip, req) {
     };
   }
 
+  // CloudFront / media_urls dogrudan akis adresi
+  if (clip && Array.isArray(clip.media_urls) && clip.media_urls.length && clip.media_urls[0].url) {
+    return {
+      url: clip.media_urls[0].url,
+      source: 'cloudfront',
+      transparent: false,
+      signature: { strategy: 'none', params: {} },
+    };
+  }
+
   // Istemci dogrudan imzali bir adres verdiyse onu kullan (allowlist kontrolu route'ta)
   const clientUrl =
     (req && (req.query.audio_url || req.query.signed_url)) ||
@@ -1731,6 +1740,16 @@ async function resolveAudioSource(clip, req) {
       source: 'client-signed',
       transparent: true,
       signature: { strategy: 'client-url', params: {} },
+    };
+  }
+
+  // Suno CloudFront klip adresi (Mango DRM)
+  if (clip && clip.id) {
+    return {
+      url: `https://d2lwuy8qc234o3.cloudfront.net/1/clip/${clip.id}.m4a`,
+      source: 'cloudfront',
+      transparent: false,
+      signature: { strategy: 'none', params: {} },
     };
   }
 
@@ -1787,16 +1806,13 @@ function normalizeClip(clip) {
     created_at: clip.created_at || null,
     image_url: clip.image_url || null,
     song_url: `https://suno.com/song/${clip.id}`,
-    // audio_url: yalnizca gercek CDN linki varsa (Pro plan). Free planda null.
-    audio_url: audioUrl,
+    // audio_url: gercek CDN linki veya desifre proxy linki
+    audio_url: audioUrl || `/stream/${clip.id}`,
     // Proxy uzerinden indirme/akis (bizim sunucumuz)
     download_url: `/download?id=${clip.id}`,
-    // Akis (browser'da <audio src> icin uygun; Range destegi yok)
-    stream_url: audioUrl ? `/download?id=${clip.id}&inline=1` : null,
-    // Neden indirilemiyor? (free plan)
-    download_blocked_reason: audioUrl
-      ? null
-      : 'Suno ucretsiz planda indirilebilir MP3 vermiyor (audio_url = /api/forbidden).',
+    // Akis (browser'da <audio src> icin)
+    stream_url: `/stream/${clip.id}`,
+    download_blocked_reason: null,
   };
 }
 
@@ -3110,6 +3126,18 @@ app.get('/track/:id', apiKeyGuard, async (req, res) => {
       download = { ready: false, reason: 'provider_has_no_download_api' };
     }
 
+    // Eger resmi indirme izni yoksa bile klip tamamlandiginda proxy
+    // uzerinden desifre edilerek MP3 olarak servis edilir.
+    if (!download.ready && track.is_complete) {
+      download = {
+        ready: true,
+        mode: 'decrypted',
+        format: 'mp3',
+        proxy_path: `/download?id=${encodeURIComponent(clipId)}`,
+        stream_path: `/stream/${encodeURIComponent(clipId)}`,
+      };
+    }
+
     return res.json({
       ok: true,
       provider: providerName,
@@ -3318,6 +3346,7 @@ app.get('/download', apiKeyGuard, async (req, res) => {
     // --- (C) Ortak boru hatti: upstream -> [ffmpeg] -> res ---
     await pipeAudioStream(req, res, {
       upstreamUrl: check.url,
+      clipId: req.query.id ? String(req.query.id).trim() : null,
       transcode: effectiveTranscode,
       format,
       filename: suggestedName,
@@ -3462,6 +3491,7 @@ app.get('/stream/:id', apiKeyGuard, async (req, res) => {
 
     await pipeAudioStream(req, res, {
       upstreamUrl: check.url,
+      clipId,
       transcode: !source.transparent && format !== 'original',
       format: format === 'original' ? 'mp3' : format,
       filename: fileName,
