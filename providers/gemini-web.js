@@ -146,8 +146,44 @@ function parseCurl(text) {
   return { method, url, headers, body };
 }
 
-/** Sablonu dosyadan (JSON veya ham cURL) yukle. */
+/**
+ * CALISMA ANINDA GELEN SABLON
+ * ---------------------------
+ * Konsol snippet'i yakaladigi istegi POST /auth/gemini-template ile gonderir;
+ * burada bellege alinir (dosya/redeploy gerekmez).
+ */
+let runtimeTemplate = null;
+
+function setTemplate(tpl) {
+  if (!tpl || typeof tpl !== 'object' || !tpl.url) return null;
+  runtimeTemplate = {
+    url: String(tpl.url),
+    method: String(tpl.method || 'POST').toUpperCase(),
+    headers: tpl.headers && typeof tpl.headers === 'object' ? tpl.headers : {},
+    body: typeof tpl.body === 'string' ? tpl.body : '',
+    capturedPrompt: typeof tpl.capturedPrompt === 'string' ? tpl.capturedPrompt : '',
+    responseSample: typeof tpl.responseSample === 'string' ? tpl.responseSample.slice(0, 5000) : '',
+    capturedAt: Date.now(),
+  };
+  return runtimeTemplate;
+}
+
+function getTemplateInfo() {
+  if (!runtimeTemplate) return null;
+  return {
+    url: runtimeTemplate.url.slice(0, 160),
+    method: runtimeTemplate.method,
+    headerCount: Object.keys(runtimeTemplate.headers).length,
+    bodyLength: runtimeTemplate.body.length,
+    capturedPrompt: runtimeTemplate.capturedPrompt,
+    capturedAt: new Date(runtimeTemplate.capturedAt).toISOString(),
+    responseSampleLength: runtimeTemplate.responseSample.length,
+  };
+}
+
+/** Sablonu bellekteki kayittan, dosyadan (JSON veya ham cURL) yukle. */
 function loadTemplate() {
+  if (runtimeTemplate) return runtimeTemplate;
   const p = String(process.env.GEMINI_WEB_REQUEST_TEMPLATE || process.env.GEMINI_WEB_CURL_FILE || '').trim();
   if (!p || !fs.existsSync(p)) return null;
   const raw = fs.readFileSync(p, 'utf8');
@@ -394,6 +430,9 @@ module.exports = {
   async getAudioSource() {
     return null;
   },
+
+  setTemplate,
+  getTemplateInfo,
 
   storeStats() {
     let bytes = 0;

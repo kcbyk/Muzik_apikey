@@ -2570,6 +2570,61 @@ app.post('/auth/token', apiKeyGuard, async (req, res) => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// POST /auth/gemini-template -> Gemini web'de yakalanan istegi yukle
+//   Konsol (no-cors) govdesi text/plain JSON:
+//   { prompt:"...", url:"...", method:"POST", headers:{...}, body:"...", responseSample:"..." }
+//   Redeploy gerekmez; sablon bellekte tutulur.
+// ---------------------------------------------------------------------------
+app.post('/auth/gemini-template', apiKeyGuard, async (req, res) => {
+  let body = req.body;
+  if (typeof body === 'string') {
+    const trimmed = body.trim();
+    try {
+      body = JSON.parse(trimmed);
+    } catch (_e) {
+      return sendError(res, 400, 'INVALID_JSON', 'Gövde JSON olmalı.');
+    }
+  }
+  if (!body || typeof body !== 'object') {
+    return sendError(res, 400, 'MISSING_BODY', 'İstek gövdesi gerekli.');
+  }
+
+  const provider = providerRegistry.providers['gemini-web'];
+  if (!provider || typeof provider.setTemplate !== 'function') {
+    return sendError(res, 500, 'PROVIDER_UNAVAILABLE', 'gemini-web sağlayıcısı yüklü değil.');
+  }
+
+  const tpl = provider.setTemplate({
+    url: body.url,
+    method: body.method,
+    headers: body.headers,
+    body: body.body,
+    capturedPrompt: body.prompt || body.capturedPrompt,
+    responseSample: body.responseSample,
+  });
+
+  if (!tpl) {
+    return sendError(res, 400, 'INVALID_TEMPLATE', 'url alanı zorunlu.');
+  }
+
+  log('info', 'Gemini şablonu yakalandı.', {
+    url: tpl.url.slice(0, 80),
+    bodyLength: tpl.body.length,
+    prompt: tpl.capturedPrompt,
+  });
+
+  return res.json({ ok: true, template: provider.getTemplateInfo() });
+});
+
+// GET /auth/gemini-template -> yakalanan şablonun özeti
+app.get('/auth/gemini-template', apiKeyGuard, (_req, res) => {
+  const provider = providerRegistry.providers['gemini-web'];
+  const info = provider && typeof provider.getTemplateInfo === 'function' ? provider.getTemplateInfo() : null;
+  res.json({ ok: true, hasTemplate: Boolean(info), template: info });
+});
+
 // ---------------------------------------------------------------------------
 // GET /token/verify  -> eldeki/yeni JWT'yi Suno anahtarlariyla dogrula
 // ---------------------------------------------------------------------------

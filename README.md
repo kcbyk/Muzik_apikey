@@ -1679,3 +1679,37 @@ Kod, cURL'ü ayrıştırır (`parseCurl`), içindeki prompt metnini yenisine çe
 | `batchexecute?rpcids=ESY5D` | ✅ `200` — `[[null,null,null,null,true]]` (özellik bayrağı) |
 | `parseCurl` + replay | ✅ cURL ayrıştırıldı, prompt değiştirildi, istek gitti |
 | Müzik üretim RPC'si | ⏳ yakalanması bekleniyor (`GEMINI_WEB_CURL_FILE`) |
+
+### 30.7 Konsoldan tek tıkla yakalama (redeploy yok)
+
+```js
+// gemini.google.com konsolunda çalıştır
+const API='https://muzik-apikey.onrender.com';
+const KEY='<API_KEY>';
+const PROMPT='dark trap beat 90 bpm';   // Gemini'ye YAZACAĞIN metnin aynısı
+const isTarget=u=>/BardChatUi|batchexecute|StreamGenerate/i.test(u);
+async function send(p){await fetch(`${API}/auth/gemini-template?api_key=${KEY}`,
+  {method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify(p)});
+  console.log('✔ yakalandı:',p.url.slice(0,70),p.body.length+'b');}
+// fetch
+const of=window.fetch;
+window.fetch=async function(i,init){const url=typeof i==='string'?i:(i&&i.url)||'';
+ const r=await of.apply(this,arguments);
+ if(isTarget(url)){try{const t=await r.clone().text();
+  if(t.length>8000){const h={};if(init&&init.headers)new Headers(init.headers).forEach((v,k)=>h[k]=v);
+  send({prompt:PROMPT,url,method:(init&&init.method)||'POST',headers:h,body:init&&init.body?String(init.body):'',responseSample:t.slice(0,200000)});}}catch(e){}}
+ return r;};
+// XHR
+const oo=XMLHttpRequest.prototype.open,os=XMLHttpRequest.prototype.send;
+XMLHttpRequest.prototype.open=function(m,u){this.__u=u;this.__m=m;return oo.apply(this,arguments)};
+XMLHttpRequest.prototype.send=function(b){
+ this.addEventListener('load',()=>{try{if(isTarget(this.__u||'')&&(this.responseText||'').length>8000)
+  send({prompt:PROMPT,url:this.__u,method:this.__m||'POST',
+   headers:{'content-type':'application/x-www-form-urlencoded'},
+   body:b?String(b):'',responseSample:this.responseText.slice(0,200000)});}catch(e){}});
+ return os.apply(this,arguments)};
+console.log('🎧 hazır — şimdi şu prompt ile müzik üret:',PROMPT);
+```
+
+Sunucuya düşen şablon `GET /auth/gemini-template` ile görülebilir; provider
+onu otomatik kullanır (`runtimeTemplate`), redeploy gerekmez.
