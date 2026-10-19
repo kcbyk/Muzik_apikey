@@ -59,10 +59,18 @@ module.exports = {
           response = await ctx.sunoRequest('post', ctx.generatePath, payload, { account });
           break;
         } catch (err) {
-          if (ctx.isCreditExhaustedError && ctx.isCreditExhaustedError(err)) {
+          const isExhausted = ctx.isCreditExhaustedError && ctx.isCreditExhaustedError(err);
+          const isAuthFailed =
+            err.status === 401 ||
+            err.isAuthError ||
+            err.code === 'AUTH_ERROR' ||
+            err.code === 'SESSION_EXPIRED' ||
+            /clerk oturumu bulunamadi|token reddi/i.test(String(err.message || err.detail || ''));
+
+          if (isExhausted || isAuthFailed) {
             creditExhausted = true;
             lastError = err;
-            break; // Model fallback'e devam etme, cunku bu hesabin kredisi bitti
+            break; // Bu hesabi atla, siradaki hesaba gec
           }
 
           const denied =
