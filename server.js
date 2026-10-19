@@ -2273,6 +2273,24 @@ function cachePutDownloadUrl(clipId, format, value) {
   });
 }
 
+/**
+ * Bakiye sorgusu (hata teshisi icin). Basarisiz olursa null doner; asla throw etmez.
+ */
+async function fetchCreditsSafe() {
+  try {
+    const data = await sunoRequest('get', '/api/billing/info/');
+    if (!data) return null;
+    return {
+      credits: data.credits,
+      is_active: data.is_active,
+      monthly_usage: data.monthly_usage,
+      monthly_limit: data.monthly_limit,
+    };
+  } catch (_err) {
+    return null;
+  }
+}
+
 /** Calisma aninda uretilen anahtarlarin deposu (utils/keyStore.js). */
 const keyStore = new KeyStore({
   enabled: CONFIG.keyStoreEnabled,
@@ -2667,6 +2685,21 @@ app.post('/generate-beat', apiKeyGuard, async (req, res) => {
     }
     if (status === 503) {
       return sendError(res, 503, err.code || 'PROVIDER_NOT_CONFIGURED', err.message, err.detail);
+    }
+    if (status === 422 || /token_validation_failed/i.test(String(err.detail || ''))) {
+      // Suno 422'yi hem "token gecersiz" hem "kredin bitti" icin donduruyor.
+      // Gercek sebebi olcelim: bakiye sifirsa bunu acikca soyle.
+      const credits = await fetchCreditsSafe();
+      if (credits && credits.credits === 0) {
+        return sendError(res, 402, 'OUT_OF_CREDITS', 'Suno kredisi bitti (credits: 0). Uretim yapilamiyor.', {
+          ...credits,
+          hint: 'Gunluk kredi sifirlandiginda veya plan yukseltilince tekrar calisir.',
+        });
+      }
+      return sendError(res, 422, 'TOKEN_REJECTED', 'Suno istegi reddetti (token veya kredi).', {
+        upstream: err.detail,
+        credits,
+      });
     }
     if (status) {
       return sendError(res, 502, err.code || 'PROVIDER_ERROR', `Saglayici ${status} dondurdu.`, err.detail);

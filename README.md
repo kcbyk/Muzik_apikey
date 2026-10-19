@@ -1409,3 +1409,39 @@ SUNO_REFRESH_TOKEN=client_xxx → /health: auth.refreshMode = "full"
 ```
 
 Token bir daha elle girilmez; ~1 yıl sonra çerez yenilenir.
+
+---
+
+## 26. ✅ Üretim yeniden çalışıyor (ve neden çalışmıyordu)
+
+### 26.1 Ölçüm
+
+Suno'nun doğru FAPI'sinden (`auth.suno.com`) alınan taze JWT ile:
+
+| Adım | Sonuç |
+|---|---|
+| `POST /generate-beat` | ✅ `200`, 2 klip: `9637a59e…`, `3c0d8c03…` |
+| `GET /track/:id?wait=true` | ✅ `complete`, 121.2 sn / 82.84 sn |
+| `GET /download?id=…` | ⛔ `is_download_unlocked: false` → `download_not_authorized` |
+
+### 26.2 Ayrım netleşti
+
+| Sorun | Gerçek sebep |
+|---|---|
+| `422 token_validation_failed` | **Eski JWT**. `auth.suno.com`'dan taze alınan token ile üretim çalışıyor. |
+| İndirme reddi | Free planda `is_download_unlocked: false`. Suno'nun plan kısıtı — proxy tarafında aşılamaz. |
+
+### 26.3 Kredi/plan
+
+```json
+{"credits": 0, "is_active": false, "monthly_usage": 80, "monthly_limit": 300, "plan": "free"}
+```
+
+Kredi 0 olsa da üretim çalıştı (ücretsiz günlük kota). İndirme için plan gerekiyor.
+
+### 26.4 Yeni hata kodları
+
+| Kod | HTTP | Anlam |
+|---|---|---|
+| `OUT_OF_CREDITS` | 402 | bakiye 0 (generate reddedildi) |
+| `TOKEN_REJECTED` | 422 | token reddedildi, bakiye ektedir |
