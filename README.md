@@ -1357,3 +1357,55 @@ yeterli değildir. `AUDIO_PROVIDER` katmanı bunun için var:
 
 `AUDIO_PROVIDER=replicate` + `REPLICATE_API_TOKEN=…` ile aynı `/generate-beat`,
 `/track`, `/download` uçları çalışır; istemci kodunda **hiçbir değişiklik olmaz**.
+
+---
+
+## 25. 🎯 Tam otomatik yenileme: doğru Clerk FAPI adresi
+
+### 25.1 Keşif
+
+Suno'nun Clerk FAPI'si **`auth.suno.com`** üzerinde — `clerk.suno.com` değil.
+
+| Host | `/v1/client` | Oturumlar |
+|---|---|---|
+| `clerk.suno.com` | `200` | `sessions: []` (boş) |
+| **`auth.suno.com`** | `200` + `Set-Cookie: __client=…` | oturum çözülür (doğru `__client` ile) |
+
+`auth.suno.com` cevabındaki `__client` bir **refresh JWT**'si:
+
+```
+payload: { "suno.com/claims/token_type": "refresh",
+           "iss": "https://auth.suno.com", "exp": 1823931179 }
+Cookie:  HttpOnly; Max-Age=31536000; SameSite=None; Secure   (~1 yıl)
+```
+
+### 25.2 Neden suno.com çerez listesinde görünmüyor?
+
+`__client` çerezi **`auth.suno.com`** host'unda duruyor; DevTools > Application
+> Cookies yalnızca üst siteyi (suno.com) listeler. Bu yüzden "yok" görünüyordu.
+Aslında var — sadece farklı host'ta.
+
+### 25.3 `__client` nasıl alınır (30 saniye)
+
+```text
+1) F12 > Network
+2) Filtre: auth.suno
+3) Sayfayı yenile (F5)
+4) Çıkan isteğe sağ tık > Copy > Copy as cURL
+5) İçindeki cookie: başlığını SUNO_REFRESH_TOKEN'a yapıştır
+```
+
+Kod, yapıştırılan metnin içinden `__client=…` değerini otomatik ayıklar
+(`buildCookieHeader()`). Sadece değeri de yapıştırabilirsin.
+
+### 25.4 Sonrası
+
+```text
+SUNO_REFRESH_TOKEN=client_xxx → /health: auth.refreshMode = "full"
+                              → keepAliveTick() her 15 dk:
+                                 GET  /v1/client            (session id)
+                                 POST /sessions/{id}/tokens (taze JWT)
+                                 POST /sessions/{id}/touch
+```
+
+Token bir daha elle girilmez; ~1 yıl sonra çerez yenilenir.

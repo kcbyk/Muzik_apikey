@@ -94,7 +94,9 @@ const CONFIG = {
   feedPath: process.env.SUNO_FEED_PATH || '/api/feed/v2',
 
   // --- Clerk Auth ---
-  clerkBaseUrl: trimSlash(process.env.CLERK_BASE_URL || 'https://clerk.suno.com'),
+  // ONEMLI: Suno'nun Clerk FAPI'si auth.suno.com uzerinde. clerk.suno.com de
+  // calisir AMA oturumlari cozmez (sessions: []). Bu yuzden varsayilan auth.suno.com.
+  clerkBaseUrl: trimSlash(process.env.CLERK_BASE_URL || 'https://auth.suno.com'),
   clerkJsVersion: process.env.CLERK_JS_VERSION || '5.35.0',
 
   // --- Oturum ---
@@ -2031,7 +2033,8 @@ async function sunoRequest(method, path, body) {
     e.code = 'SESSION_EXPIRED';
     e.detail =
       'SUNO_REFRESH_TOKEN (__client cookie) tanimli degil, bu yuzden otomatik yenileme yapilamiyor. ' +
-      'Cozum: DevTools > Application > Cookies > clerk.suno.com > __client degerini SUNO_REFRESH_TOKEN ' +
+      'Cozum: DevTools > Network > filtre "auth.suno" > istege sag tik > Copy as cURL; ' +
+      'Cookie basligindaki __client degerini SUNO_REFRESH_TOKEN ' +
       'olarak ekle; sonrasinda token otomatik yenilenir. Alternatif: /auth/token ile taze JWT gonder.';
     throw e;
   }
