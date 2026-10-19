@@ -40,9 +40,15 @@ function cleanTokenString(val) {
   if ((str.startsWith('"') && str.endsWith('"')) || (str.startsWith("'") && str.endsWith("'"))) {
     str = str.slice(1, -1).trim();
   }
-  // Cookie: ... icinden __client ayikla
+  if (str.startsWith('Bearer ')) {
+    str = str.slice(7).trim();
+  }
+  // Cookie basligindan __client veya __session ayikla
   if (str.includes('__client=')) {
     const m = str.match(/__client=([^;]+)/);
+    if (m) str = m[1].trim();
+  } else if (str.includes('__session=')) {
+    const m = str.match(/__session=([^;]+)/);
     if (m) str = m[1].trim();
   }
   return str;
@@ -63,6 +69,16 @@ class SunoAccount {
     this.refreshCount = 0;
     this.lastError = null;
     this.inFlight = null;
+
+    // Eger verilen token bir JWT ise (__session veya hazir token)
+    const payload = decodeJwtPayload(this.refreshToken);
+    if (payload) {
+      if (payload.sid) this.sessionId = payload.sid;
+      if (payload.exp) {
+        this.expiresAt = payload.exp * 1000;
+        this.accessToken = this.refreshToken;
+      }
+    }
 
     // Limit ve kullanim durumu
     this.isExhausted = false;
