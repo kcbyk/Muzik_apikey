@@ -128,7 +128,7 @@ const CONFIG = {
   // Yalnizca bu host'lardan akis yapilir. "*" KULLANMAYIN.
   downloadAllowedHosts: (
     process.env.DOWNLOAD_ALLOWED_HOSTS ||
-    'audiopipe.suno.ai,cdn1.suno.ai,cdn2.suno.ai,cdn.suno.ai,studio-api-prod.suno.com,studio-api.prod.suno.com'
+    'audiopipe.suno.ai,cdn1.suno.ai,cdn2.suno.ai,cdn.suno.ai,studio-api-prod.suno.com,studio-api.prod.suno.com,suno-data-uploads.s3.amazonaws.com'
   )
     .split(',')
     .map((h) => h.trim().toLowerCase())
@@ -512,6 +512,24 @@ class ByteRangeTransform extends Transform {
  *
  * @returns {Promise<Buffer|null|undefined>} chunk | null (bos akis) | undefined (zaman asimi)
  */
+/**
+ * Govdenin DUZ ses olup olmadigini ilk baytlardan anlar.
+ * Kabul edilen basliklar: ID3 (mp3), frame sync 0xFFEx/0xFFFx, RIFF (wav),
+ * fLaC, OggS, ftyp (mp4/m4a), 'ftyp' farkli offsette olabilir.
+ */
+function isPlainAudioHeader(chunk) {
+  if (!chunk || chunk.length < 4) return false;
+  const b = Buffer.from(chunk.subarray(0, 12));
+  const hex = b.toString('hex');
+  if (hex.startsWith('494433')) return true;              // "ID3"
+  if (hex.startsWith('52494646')) return true;            // "RIFF"
+  if (hex.startsWith('664c6143')) return true;            // "fLaC"
+  if (hex.startsWith('4f676753')) return true;            // "OggS"
+  if (b[0] === 0xff && (b[1] & 0xe0) === 0xe0) return true; // mp3/aac frame sync
+  if (b.slice(4, 8).toString('latin1') === 'ftyp') return true; // mp4/m4a
+  return false;
+}
+
 function peekFirstChunk(stream, timeoutMs = 8000) {
   return new Promise((resolve) => {
     let settled = false;
@@ -950,6 +968,24 @@ async function pipeAudioStream(req, res, opts) {
       'UPSTREAM_STALLED',
       'Upstream baglandi fakat 8 saniye icinde veri gondermedi.',
       `upstream_status=${upstream.status} content_type=${upstream.headers['content-type'] || '-'}`,
+    );
+  }
+
+  // --- Sifreli (DRM) govde tespiti -----------------------------------------
+  // Suno'nun audiopipe/CDN govdesi AES sifreli gelebilir: ilk baytlarda ID3,
+  // RIFF, fLaC, OggS veya mp3 frame sync yoktur ve entropi ~8 bit/bayttir.
+  // Boyle bir govdeyi istemciye "ses" diye gondermek yerine ACIKCA soyluyoruz.
+  if (!isPlainAudioHeader(peeked)) {
+    cleanup();
+    return sendError(
+      res,
+      409,
+      'CLIP_ENCRYPTED',
+      'Bu klip sifreli (DRM) akis donduruyor; cozulmemis baytlar istemciye gonderilmedi. ' +
+        'Indirme hakkina sahip kliplerde resmi indirme ucu (X-Download-Mode: official-api) duz MP3 verir.',
+      `upstream_status=${upstream.status} content_type=${upstream.headers['content-type'] || '-'} ` +
+        `first_bytes=${peeked ? Buffer.from(peeked.subarray(0, 8)).toString('hex') : '-'} ` +
+        `cozulmemis ses almak icin: /debug/stream/:id (teshis) — sifre cozme kapsam disidir.`,
     );
   }
 
@@ -1984,12 +2020,45 @@ async function sunoRequest(method, path, body) {
 const activeProvider = () => providerRegistry.getProvider();
 
 // Suno adaptoru, bu dosyadaki hazir fonksiyonlari kullanir (kod tekrari yok).
+/**
+ * SUNO RESMI INDIRME UCU
+ * ----------------------
+ * Tarayicida "Indir" butonuna basildiginda Suno sunlari yapar:
+ *
+ *   POST /api/download/authorize       (opsiyonel onay)
+ *   GET  /api/download/clip/{id}?format=mp3
+ *        -> { ok: true, status: "ready",
+ *             download_url: "https://suno-data-uploads.s3.amazonaws.com/...&Signature=...&Expires=..." }
+ *
+ * download_url imzali (presigned) bir S3 linkidir ve ~5 dakika yasar.
+ * Indirilen dosya DUZ MP3'tur (ID3 basligi, ffmpeg ile cozulur) — audiopipe'in
+ * aksine sifreli DEGILDIR. Bu, hesabin indirme hakkina sahip oldugu klipler
+ * icin calisir (feed'de is_download_unlocked=true).
+ *
+ * Not: burada sifre cozme YOKTUR; Suno'nun kendi tarayiciya verdigi dosya
+ * oldugu gibi aktarilir.
+ */
+async function fetchSunoDownloadUrl(clipId, format = 'mp3') {
+  const fmt = ['mp3', 'wav'].includes(String(format).toLowerCase()) ? String(format).toLowerCase() : 'mp3';
+  const data = await sunoRequest('get', `/api/download/clip/${encodeURIComponent(clipId)}?format=${fmt}`);
+  const url = data && (data.download_url || data.url);
+  if (!url) return null;
+
+  const check = isAllowedDownloadUrl(url);
+  if (!check.ok) {
+    log('warn', 'Indirme URL\'si allowlist disinda.', check.reason);
+    return null;
+  }
+  return { url: check.url, status: (data && data.status) || 'ready', format: fmt };
+}
+
 providerRegistry.providers.suno.init({
   sunoRequest,
   fetchClip,
   normalizeClip,
   resolveAudioSource,
   runStreamHandshake,
+  fetchDownloadUrl: fetchSunoDownloadUrl,
   modelFallback: CONFIG.modelFallback,
   defaultModel: CONFIG.defaultModel,
   defaultInstrumental: CONFIG.defaultInstrumental,
@@ -2626,6 +2695,35 @@ app.get('/download', apiKeyGuard, async (req, res) => {
       clipTitle = track.title || '';
       requestedFormat = String(req.query.format || 'mp3').toLowerCase();
 
+      // --- Once SUNO RESMI INDIRME UCU (duz MP3, sifresiz) ---
+      // Sadece indirme hakkina sahip kliplerde calisir; olmazsa asagidaki
+      // normal akisa (audiopipe / CDN) duser.
+      if (typeof provider.getDownloadSource === 'function' && !req.query.no_download_api) {
+        try {
+          // Suno bu hesapta yalnizca mp3 veriyor; wav istenirse mp3 alip ceviririz.
+          const dl = await provider.getDownloadSource(clipId, 'mp3');
+          if (dl && dl.url) {
+            res.setHeader('X-Download-Mode', 'official-api');
+            if (!suggestedName) {
+              const slug = slugifyText(clipTitle, 'suno');
+              suggestedName = `${slug}-${clipId.slice(0, 8)}.${format}`;
+            }
+            log('info', 'Resmi indirme ucu kullanildi.', { clipId, format, status: dl.status });
+            return await pipeAudioStream(req, res, {
+              upstreamUrl: dl.url,
+              transcode: format === 'wav', // mp3 -> wav gerekirse ffmpeg
+              format,
+              filename: suggestedName,
+              inline,
+              proxyMode: 'official',
+              sessionId: handshakeSessionId,
+            });
+          }
+        } catch (err) {
+          log('warn', 'Resmi indirme ucu basarisiz, normal akisa donuluyor.', sanitizeMessage(err.message));
+        }
+      }
+
       const source = await provider.getAudioSource(track);
       if (!source) {
         return sendError(
@@ -2746,6 +2844,30 @@ app.get('/stream/:id', apiKeyGuard, async (req, res) => {
     }
     if (track.is_error) {
       return sendError(res, 409, 'TRACK_FAILED', `Uretim basarisiz (${providerName}).`, track.download_blocked_reason);
+    }
+
+    // --- Once SUNO RESMI INDIRME UCU: duz MP3, tarayicida <audio> ile calar ---
+    // (indirme hakkina sahip kliplerde calisir; olmazsa audiopipe'a duser)
+    if (typeof provider.getDownloadSource === 'function' && !envBool(req.query.no_download_api, false)) {
+      try {
+        const dl = await provider.getDownloadSource(clipId, 'mp3');
+        if (dl && dl.url) {
+          res.setHeader('X-Download-Mode', 'official-api');
+          res.setHeader('X-Sign-Strategy', 'none');
+          log('info', 'Stream: resmi indirme ucu.', { clipId, status: dl.status });
+          return await pipeAudioStream(req, res, {
+            upstreamUrl: dl.url,
+            transcode: false,
+            format: 'mp3',
+            filename: `${slugifyText(track.title, 'beat')}-${clipId.slice(0, 8)}.mp3`,
+            inline: true,
+            proxyMode: 'official',
+            sessionId: handshakeSessionId,
+          });
+        }
+      } catch (err) {
+        log('debug', 'Resmi indirme ucu yok, audiopipe akisina geciliyor.', sanitizeMessage(err.message));
+      }
     }
 
     const source = await provider.getAudioSource(track);

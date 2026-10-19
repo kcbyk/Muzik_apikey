@@ -1147,3 +1147,56 @@ Kalıcı kayıt için Render Disk + `KEY_STORE_FILE=/data/keys.json`.
 | Bootstrap (hiç anahtar yok) | `201`, `role: admin` |
 | Bootstrap sonrası anahtarsız istek | `401` |
 | Diskte saklanan | yalnızca `hash` + `prefix` |
+
+---
+
+## 21. ⬇️ Resmî indirme ucu (düz MP3)
+
+### 21.1 Keşif
+
+Tarayıcıda "İndir" butonuna basıldığında Suno şu akışı izliyor (ağ logundan ölçüldü):
+
+```
+POST /api/download/authorize                      (opsiyonel onay)
+GET  /api/download/clip/{id}?format=mp3           -> { ok, status:"ready", download_url }
+     download_url = https://suno-data-uploads.s3.amazonaws.com/studio/uploads/{id}.mp3
+                    ?response-content-type=audio%2Fmpeg&AWSAccessKeyId=...&Signature=...&Expires=...
+     -> 200, audio/mpeg, ŞİFRESİZ MP3 (ID3 başlıklı, ffmpeg ile çözülüyor)
+```
+
+Bu, `audiopipe`'ın (AES şifreli) tamamen ayrı bir yolu: **Suno'nun kendi tarayıcıya
+verdiği dosya**. Proxy bu dosyayı olduğu gibi aktarır — çözme/kırma yoktur.
+
+### 21.2 Entegrasyon
+
+- `providers/suno.js` → `getDownloadSource(clipId, format)` (opsiyonel provider yeteneği)
+- `server.js` → `fetchSunoDownloadUrl()` ; `suno-data-uploads.s3.amazonaws.com` allowlist'e eklendi
+- `/download?id=` ve `/stream/:id` **önce** resmî indirme ucunu dener; olmazsa eskisi gibi
+  audiopipe/CDN'e düşer. Kapatmak için `?no_download_api=1`.
+- Yanıt başlıkları: `X-Download-Mode: official-api`, `X-Proxy-Mode: official`
+- `format=wav` → Suno'dan mp3 alınır, ffmpeg ile WAV'a çevrilir.
+
+### 21.3 Şifreli gövde koruması (yeni)
+
+Resmî indirme ucu başarısız olursa (indirme hakkı yok) proxy şifreli baytları
+"ses" diye göndermek yerine açıkça hata verir:
+
+```json
+{ "ok": false, "error": { "code": "CLIP_ENCRYPTED",
+  "message": "Bu klip sifreli (DRM) akis donduruyor; cozulmemis baytlar istemciye gonderilmedi." } }
+```
+
+Tespit: ilk baytlarda `ID3` / `RIFF` / `fLaC` / `OggS` / mp3 frame sync / `ftyp` yoksa.
+
+### 21.4 Ölçümler (gerçek hesap, 19 Ekim 2026)
+
+| Test | Sonuç |
+|---|---|
+| Sağlayıcı ucu (doğrudan) | `200`, `download_url` presigned S3 |
+| S3 dosyası | `3 764 184 B`, `audio/mpeg`, `ID3`, ffmpeg: **2:45, 48 kHz stereo** |
+| `GET /download?id=` | `200`, 3 764 184 B, `X-Download-Mode: official-api` |
+| `GET /stream/:id` | `200`, aynı dosya, `<audio>` ile çalar |
+| `Range: bytes=1000-1999` | `206`, 1000 B |
+| `format=wav` | `200`, 31 717 294 B, `RIFF` (ffmpeg dönüşümü) |
+| İndirme hakkı olmayan klip | `200`, 4 138 943 B, ffmpeg: 2:58 — bu hesapta da indirilebilir |
+| Şifreli audiopipe yolu | `409 CLIP_ENCRYPTED` (artık çöp bayt gönderilmiyor) |

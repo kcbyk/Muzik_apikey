@@ -84,6 +84,27 @@ module.exports = {
     return ctx.resolveAudioSource(clip);
   },
 
+  /**
+   * Suno'nun RESMI indirme ucu (tarayicidaki "Indir" butonuyla ayni akis).
+   *   GET /api/download/clip/{id}?format=mp3  ->  { download_url, status }
+   * download_url presigned S3 linkidir, duz MP3 dondurur.
+   * Indirme hakki olmayan kliplerde null doner (cagiran taraf normal akisa duser).
+   */
+  async getDownloadSource(clipOrId, format = 'mp3') {
+    if (!ctx || !ctx.fetchDownloadUrl) return null;
+    const clipId = typeof clipOrId === 'string' ? clipOrId : clipOrId && clipOrId.id;
+    if (!clipId) return null;
+    const result = await ctx.fetchDownloadUrl(clipId, format);
+    if (!result) return null;
+    return {
+      url: result.url,
+      source: 'suno-official-download',
+      transparent: true,
+      format: result.format,
+      status: result.status,
+    };
+  },
+
   /** Suno'ya ozgu: akis oncesi handshake (analytics session + listen_milestone). */
   async beforeStream(clipId) {
     if (!ctx || !ctx.runStreamHandshake) return null;
