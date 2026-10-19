@@ -2674,6 +2674,25 @@ app.post('/generate-beat', apiKeyGuard, async (req, res) => {
     if (status === 429) {
       return sendError(res, 429, 'RATE_LIMITED', 'Istek limiti asildi, biraz sonra tekrar deneyin.', err.detail);
     }
+    if (status === 402) {
+      // Replicate: "Insufficient credit" — kullaniciya net soyle.
+      const isCredit = /insufficient credit/i.test(String(err.detail || ''));
+      return sendError(
+        res,
+        402,
+        isCredit ? 'PROVIDER_INSUFFICIENT_CREDIT' : 'PAYMENT_REQUIRED',
+        isCredit
+          ? 'Saglayici bakiyesi yetersiz. Replicate hesabina kredi yukle.'
+          : 'Saglayici odeme istedi (402).',
+        {
+          provider: providerRegistry.getProviderName(),
+          billing_url: providerRegistry.getProviderName() === 'replicate'
+            ? 'https://replicate.com/account/billing'
+            : null,
+          upstream: err.detail,
+        },
+      );
+    }
     if (status === 401) {
       // Saglayiciya gore mesaj: suno'da JWT, digerlerinde API token.
       if (providerRegistry.getProviderName() === 'suno') {

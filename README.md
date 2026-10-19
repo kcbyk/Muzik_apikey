@@ -1542,3 +1542,14 @@ GET  /download?url=… -> herhangi bir düz URL
 | `stability-ai/stable-audio-2.5` | ~$0.20 / parça |
 
 Token: https://replicate.com/account/api-tokens
+
+### 28.6 Gerçek ölçüm (2026-10-19)
+
+| Adım | Sonuç |
+|---|---|
+| `GET /v1/account` (token testi) | ✅ `200`, kullanıcı: `kcbyk` |
+| `GET /v1/models/meta/musicgen` | ✅ `200`, sürüm `671ac645…` |
+| `POST /generate-beat` | ⚠️ `402 PROVIDER_INSUFFICIENT_CREDIT` |
+
+Replicate hesabında bakiye yok. Kredi yüklenince aynı akış çalışır:
+https://replicate.com/account/billing (min. $5; MusicGen ~$0.03–0.10/parça).
