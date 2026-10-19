@@ -1712,7 +1712,7 @@ function signerStatus() {
  * stratejisi havuzdan (TTL'li) gelebilir.
  */
 async function resolveAudioSource(clip, req) {
-  if (clip && clip.audio_url && !isForbiddenUrl(clip.audio_url)) {
+  if (clip && clip.audio_url && String(clip.audio_url).startsWith('http') && !isForbiddenUrl(clip.audio_url)) {
     return {
       url: clip.audio_url,
       source: 'cdn',
@@ -1807,8 +1807,8 @@ function normalizeClip(clip) {
     created_at: clip.created_at || null,
     image_url: clip.image_url || null,
     song_url: `https://suno.com/song/${clip.id}`,
-    // audio_url: gercek CDN linki veya desifre proxy linki
-    audio_url: audioUrl || `/stream/${clip.id}`,
+    // audio_url: yalnizca gercek CDN linki varsa (Pro plan). Free planda null.
+    audio_url: audioUrl,
     // Proxy uzerinden indirme/akis (bizim sunucumuz)
     download_url: `/download?id=${clip.id}`,
     // Akis (browser'da <audio src> icin)
