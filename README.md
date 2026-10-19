@@ -1200,3 +1200,48 @@ Tespit: ilk baytlarda `ID3` / `RIFF` / `fLaC` / `OggS` / mp3 frame sync / `ftyp`
 | `format=wav` | `200`, 31 717 294 B, `RIFF` (ffmpeg dönüşümü) |
 | İndirme hakkı olmayan klip | `200`, 4 138 943 B, ffmpeg: 2:58 — bu hesapta da indirilebilir |
 | Şifreli audiopipe yolu | `409 CLIP_ENCRYPTED` (artık çöp bayt gönderilmiyor) |
+
+---
+
+## 22. ⬇️ Kendi indirme servisimiz (URL'den)
+
+### 22.1 Uçlar
+
+| Uç | Ne yapar |
+|---|---|
+| `GET /download/info?url=…` | **Önizleme** — HEAD (gerekirse `Range: bytes=0-0`) ile boyut/tür/Range desteği/dosya adı |
+| `GET /download?url=…` | **İndir** — baytları olduğu gibi aktarır (Range korunur) |
+| `GET /download?url=…&filename=…` | Dosya adını elle ver |
+| `GET /download?url=…&format=wav` | İndirip WAV'a çevir (ffmpeg) |
+| `GET /download?url=…&mode=stream` | `inline` gönder (tarayıcıda çalar) |
+
+Dashboard'da **"URL'den İndir"** paneli: adresi yapıştır → *Önizle* → *İndir*.
+
+### 22.2 Dosya adı türetme
+
+`https://…/studio/uploads/268c2ab7-….mp3?Signature=…` → `268c2ab7-….mp3`
+(yol dosya adı içermiyorsa `indir-<zaman>.<uzantı>`).
+
+### 22.3 SSRF koruması (değişmedi)
+
+Yalnızca `DOWNLOAD_ALLOWED_HOSTS` + `*.suno.ai` alt alanları. `http://` ve IP
+literalleri varsayılan olarak reddedilir. Sunucu **hiçbir baytı değiştirmez**.
+
+```bash
+# kendi host'unu eklemek icin
+DOWNLOAD_ALLOWED_HOSTS=suno-data-uploads.s3.amazonaws.com,cdn.ornek.com
+```
+
+### 22.4 Ölçümler (yerel, gerçek presigned S3 linki)
+
+| Test | Sonuç |
+|---|---|
+| `/download/info` | `boyut: 3764184`, `audio/mpeg`, `range: bytes`, `ad: 268c2ab7-….mp3` |
+| `/download?url=` | `200`, **3 764 184 B**, `X-Proxy-Mode: direct` |
+| `Content-Disposition` | `attachment; filename="268c2ab7-….mp3"` |
+| `Range: bytes=0-1023` | `206`, 1024 B |
+| allowlist dışı host | `403 URL_NOT_ALLOWED` |
+
+> Bu servis **bayt aktarımı** yapar. Erişim izni olmayan / şifreli bir kaynağı
+> "açma" iddiası yoktur: kaynak ne döndürüyorsa onu iletir. Suno'nun
+> `not_authorized` cevabı bir erişim kısıtıdır ve proxy tarafında aşılamaz.

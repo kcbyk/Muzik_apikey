@@ -101,6 +101,16 @@
   details.manage summary{cursor:pointer;font-size:12px;color:var(--muted);list-style:none;margin-top:12px}
   details.manage summary::-webkit-details-marker{display:none}
 
+  /* --- url downloader --- */
+  .urlrow{display:flex;gap:8px}
+  .urlrow input{flex:1;min-width:0}
+  .meta{
+    margin-top:10px;padding:10px 12px;border-radius:10px;background:#0e121a;
+    border:1px solid var(--line);font-size:12px;color:var(--muted);line-height:1.8;
+  }
+  .meta b{color:#c7d4e8;font-weight:600}
+  .meta .row2{display:flex;justify-content:space-between;gap:10px}
+
   /* --- results --- */
   .results-head{display:flex;align-items:center;gap:10px;margin-bottom:14px}
   .results-head h2{margin:0}
@@ -221,6 +231,21 @@
         </div>
         <button class="btn btn-primary" id="generate">⚡ Beat üret</button>
         <div class="hint" id="genHint">Üretim genelde 30–90 sn sürer; sonuçlar otomatik olarak yoklanır.</div>
+      </div>
+    </div>
+
+      <div class="card">
+        <h2>URL'den İndir</h2>
+        <div class="field">
+          <label for="dlUrl">Dosya adresi</label>
+          <input type="text" id="dlUrl" placeholder="https://…/dosya.mp3" />
+        </div>
+        <div class="urlrow">
+          <button class="btn btn-ghost btn-sm" id="dlInfo">Önizle</button>
+          <button class="btn btn-primary btn-sm" id="dlGo" style="flex:1">⬇ İndir</button>
+        </div>
+        <div id="dlMeta" class="meta" style="display:none"></div>
+        <div class="hint">Yalnızca sunucudaki allowlist'teki host'lar (<b>DOWNLOAD_ALLOWED_HOSTS</b>) kabul edilir. Sunucu baytları değiştirmez, olduğu gibi aktarır.</div>
       </div>
     </div>
 
@@ -619,6 +644,59 @@
     localStorage.setItem(LS_KEY, v);
     toast('Anahtar kullanıma alındı.', 'ok');
     refreshStatus();
+  };
+
+  // ---------------------------------------------------------------------
+  //  Kendi indirme servisi: URL'den indir
+  // ---------------------------------------------------------------------
+  function dlUrlValue() {
+    const u = $('dlUrl').value.trim();
+    if (!u) { toast('Önce bir dosya adresi gir.', 'err'); return ''; }
+    if (!/^https?:\/\//i.test(u)) { toast('Adres http(s):// ile başlamalı.', 'err'); return ''; }
+    return u;
+  }
+
+  $('dlInfo').onclick = async () => {
+    const u = dlUrlValue();
+    if (!u) return;
+    const box = $('dlMeta');
+    box.style.display = '';
+    box.textContent = 'sorgulanıyor…';
+    try {
+      const d = await api('/download/info?url=' + encodeURIComponent(u));
+      logLine('GET /download/info', d);
+      const kb = d.content_length ? (Number(d.content_length) / 1024 / 1024).toFixed(2) + ' MB' : 'bilinmiyor';
+      box.innerHTML = `
+        <div class="row2"><span>durum</span><b>${d.status}</b></div>
+        <div class="row2"><span>tür</span><b>${d.content_type || '—'}</b></div>
+        <div class="row2"><span>boyut</span><b>${kb}</b></div>
+        <div class="row2"><span>seek (Range)</span><b>${d.accept_ranges || 'yok'}</b></div>
+        <div class="row2"><span>dosya adı</span><b>${d.filename}</b></div>`;
+    } catch (err) {
+      box.textContent = 'Hata: ' + (err.code || '') + ' ' + err.message;
+      toast('Önizleme başarısız: ' + err.message, 'err');
+    }
+  };
+
+  $('dlGo').onclick = async () => {
+    const u = dlUrlValue();
+    if (!u) return;
+    const btn = $('dlGo');
+    btn.disabled = true;
+    try {
+      // Bilinen dosya adini sunucuya ver (yoksa URL'den turetir)
+      let name = '';
+      if ($('dlMeta').style.display !== 'none') {
+        const m = $('dlMeta').querySelector('.row2:last-child b');
+        if (m) name = m.textContent;
+      }
+      const url = '/download?url=' + encodeURIComponent(u) + (name ? '&filename=' + encodeURIComponent(name) : '');
+      logLine('GET /download?url=…', u.slice(0, 120));
+      window.location.href = withKey(url);
+      toast('İndirme başlatıldı.');
+    } finally {
+      setTimeout(() => { btn.disabled = false; }, 1500);
+    }
   };
 
   $('generate').onclick = generate;

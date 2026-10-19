@@ -677,6 +677,32 @@ function makeCleanup(upstreamStream, proc) {
  *
  * @returns {Promise<void>}
  */
+/**
+ * URL yolundan guvenli bir dosya adi turetir.
+ *   https://host/a/b/Gece%20Yagmuru.mp3?Signature=...  ->  Gece-Yagmuru.mp3
+ * Yol bir dosya adi icermiyorsa `indir-<zaman>.<uzanti>` doner.
+ */
+function deriveFilenameFromUrl(rawUrl, fallbackExt = 'mp3') {
+  try {
+    const u = new URL(String(rawUrl));
+    const last = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || '');
+    if (last && /\.[A-Za-z0-9]{2,5}$/.test(last)) {
+      const base = last.replace(/\.[A-Za-z0-9]{2,5}$/, '');
+      const ext = last.split('.').pop().toLowerCase();
+      const safeBase =
+        base
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '')
+          .slice(0, 60) || 'indir';
+      return `${safeBase}.${ext}`;
+    }
+  } catch (_e) {
+    /* gecersiz URL -> fallback */
+  }
+  return `indir-${Date.now()}.${fallbackExt}`;
+}
+
 /** Akis/probe icin upstream header set'i (tek kaynak: tutarlilik). */
 function buildStreamUpstreamHeaders(req, sessionId) {
   const cookieHeader = buildUpstreamCookieHeader(authState.accessToken || CONFIG.sessionToken || null);
@@ -2764,7 +2790,8 @@ app.get('/download', apiKeyGuard, async (req, res) => {
       return sendError(res, 403, 'URL_NOT_ALLOWED', `Indirme adresi reddedildi: ${check.reason}`);
     }
 
-    if (!suggestedName) suggestedName = `suno-${Date.now()}.${format}`;
+    // Dosya adi verilmediyse URL yolundan turet (query string haric).
+    if (!suggestedName) suggestedName = deriveFilenameFromUrl(targetUrl, format);
 
     const effectiveTranscode = forceTransparent ? false : wantTranscode;
 
@@ -3455,6 +3482,77 @@ app.post('/keys/:id/revoke', apiKeyGuard, (req, res) => {
   const ok = keyStore.revoke(id);
   if (!ok) return sendError(res, 404, 'KEY_NOT_FOUND', `Anahtar bulunamadi: ${id}`);
   return res.json({ ok: true, revoked: true, id, store: keyStore.stats_() });
+});
+
+// ---------------------------------------------------------------------------
+// GET /download/info  ->  URL on izlemesi (boyut, tip, Range destegi, dosya adi)
+// ---------------------------------------------------------------------------
+//  Kendi indirme servisimizin "once bak sonra indir" adimi. Govdeyi INDIRMEZ;
+//  yalnizca HEAD (olmazsa Range: bytes=0-0) atar.
+//
+//    ?url=https://...     allowlist gecerli
+//
+//  Yanit: { ok, status, content_type, content_length, accept_ranges, filename,
+//           final_url, elapsed_ms }
+// ---------------------------------------------------------------------------
+app.get('/download/info', apiKeyGuard, async (req, res) => {
+  const raw = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+  if (!raw) return sendError(res, 400, 'MISSING_TARGET', '?url=<https://...> gerekli.');
+
+  const check = isAllowedDownloadUrl(raw);
+  if (!check.ok) return sendError(res, 403, 'URL_NOT_ALLOWED', `Adres reddedildi: ${check.reason}`);
+
+  const startedAt = Date.now();
+  const headers = buildStreamUpstreamHeaders(req, null);
+  delete headers.Range;
+
+  let r;
+  try {
+    r = await axios({
+      method: 'head',
+      url: check.url,
+      timeout: 15000,
+      maxRedirects: 5,
+      validateStatus: () => true,
+      headers,
+      httpsAgent: getUpstreamAgent(),
+      proxy: false,
+    });
+    // Bazi sunucular HEAD'i desteklemez -> 0-0 araligi ile dene
+    if (r.status === 405 || r.status === 501 || !r.headers['content-length']) {
+      r = await axios({
+        method: 'get',
+        url: check.url,
+        timeout: 20000,
+        maxRedirects: 5,
+        responseType: 'stream',
+        validateStatus: () => true,
+        headers: { ...headers, Range: 'bytes=0-0' },
+        httpsAgent: getUpstreamAgent(),
+        proxy: false,
+      });
+      if (r.data && typeof r.data.destroy === 'function') r.data.destroy();
+    }
+  } catch (err) {
+    return sendError(res, 502, 'HEAD_FAILED', 'Adres on izlemesi basarisiz.', err.message);
+  }
+
+  const ct = r.headers['content-type'] || null;
+  const extGuess = ct && ct.includes('mpeg') ? 'mp3' : ct && ct.includes('mp4') ? 'm4a' : ct && ct.includes('wav') ? 'wav' : 'bin';
+  const cr = r.headers['content-range'];
+
+  return res.json({
+    ok: true,
+    status: r.status,
+    content_type: ct,
+    // Range fallback'te Content-Length "1" olur; toplam boyut Content-Range'den gelir.
+    content_length: cr && cr.includes('/') ? cr.split('/')[1] : r.headers['content-length'] || null,
+    accept_ranges: r.headers['accept-ranges'] || (r.status === 206 ? 'bytes' : null),
+    last_modified: r.headers['last-modified'] || null,
+    filename: deriveFilenameFromUrl(check.url, extGuess),
+    final_url: String(r.request && r.request.res && r.request.res.responseUrl ? r.request.res.responseUrl : check.url).slice(0, 300),
+    elapsed_ms: Date.now() - startedAt,
+  });
 });
 
 // ---------------------------------------------------------------------------
