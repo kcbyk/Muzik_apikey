@@ -385,10 +385,10 @@ class AccountPool {
     return this.accounts.find((a) => a.id === id) || null;
   }
 
-  markAccountExhausted(accountOrId, reason) {
+  markAccountExhausted(accountOrId, reason, durationMs = null) {
     const act = typeof accountOrId === 'string' ? this.getAccountById(accountOrId) : accountOrId;
     if (act) {
-      act.markExhausted(reason);
+      act.markExhausted(reason, durationMs);
     }
   }
 
