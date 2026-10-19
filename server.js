@@ -351,9 +351,10 @@ function sanitizeUrlForLog(rawUrl) {
 }
 
 function sanitizeMessage(message) {
-  return String(message || '')
+  const str = (message && typeof message === 'object') ? JSON.stringify(message) : String(message || '');
+  return str
     .replace(/eyJ[A-Za-z0-9._-]{10,}/g, '<token>')
-    .slice(0, 600);
+    .slice(0, 1000);
 }
 
 /** HTTP durum kodu tasiyan hata (route katmani bunu dogru status'e cevirir). */
