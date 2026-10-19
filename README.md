@@ -1771,3 +1771,74 @@ Başarısız görevler otomatik iade.
 |---|---|
 | `POST /generate-beat` (geçersiz anahtar) | `REAPI_ERROR` + `"Invalid API key."` — uç ve şema doğru |
 | Sağlayıcı kaydı | ✅ `['suno','replicate','google','gemini-web','reapi','elevenlabs','mock']` |
+
+---
+
+## 32. 🔧 İndirme hattı sertleştirmesi (allowlist / redirect / retry / log)
+
+### 32.1 Değişenler
+
+| Dosya | Ne değişti |
+|---|---|
+| `server.js` | allowlist eşleşmesi, güvenli redirect takibi, retry, erişim logu, `GET /track` indirme durumu |
+| `public/index.html` | "İndir" butonu yalnızca `status=complete` **ve** `download.ready=true` iken aktif |
+
+### 32.2 Allowlist kuralları (yeni)
+
+```text
+1) Tam eşleşme      : cdn1.suno.ai
+2) Alt alan adı     : listede "suno.ai" varsa "a.b.suno.ai" de geçer ("evilsuno.ai" GEÇMEZ)
+3) Nokta öneki      : ".suno.ai" yazımı da kabul
+4) Büyük/küçük harf : iki taraf da lowercase
+5) Port             : yalnızca 443 (yerel dev modunda serbest)
+6) IP / localhost / *.local / *.internal : her zaman red
+```
+
+Reddedilince dönen cevap artık **ne yapılacağını** söylüyor:
+
+```json
+{"ok":false,"error":{"code":"URL_NOT_ALLOWED",
+ "message":"İndirme adresi reddedildi: Host izinli değil: kotu-site.example",
+ "detail":"DOWNLOAD_ALLOWED_HOSTS değişkenine bu host'u ekleyin (şu an izinli: …)"}}
+```
+
+### 32.3 Redirect + SSRF
+
+Her yönlendirme hedefi **tekrar** allowlist'ten geçer (`maxRedirects: 0` + elle döngü,
+en fazla `DOWNLOAD_MAX_REDIRECTS`). Ölçüm:
+
+```
+/download?url=http://127.0.0.1:3455/r     → 302 → /final → 200, 200 003 B
+/download?url=…/evil (302 → 169.254.169.254) → 403 URL_NOT_ALLOWED (hop=1)
+```
+
+### 32.4 Retry / timeout
+
+| Env | Varsayılan | Etki |
+|---|---|---|
+| `DOWNLOAD_TIMEOUT_MS` | 60000 | İlk bayt için üst sınır (Render 100 sn limitinin altında) |
+| `DOWNLOAD_MAX_RETRIES` | 2 | ECONNRESET / ETIMEDOUT / 5xx için üstel geri çekilme (300/600 ms) |
+| `DOWNLOAD_MAX_REDIRECTS` | 5 | Yönlendirme zinciri sınırı |
+
+Retry yalnızca **gövde tüketilmeden önce** yapılır; bayt kaybı olmaz.
+
+### 32.5 Log (API anahtarı asla yazılmaz)
+
+```json
+{"method":"GET","path":"/download?url=…&api_key=<gizli>","status":206,
+ "mode":"direct","length":"1024","contentType":"audio/mpeg","ms":5}
+{"from":"127.0.0.1","to":"169.254.169.254","status":302,"hop":1}
+```
+
+`api_key`, `token`, `signature` gibi parametrelerin değeri `sanitizeUrlForLog()` ile maskelenir.
+
+### 32.6 Test matrisi
+
+| Test | Sonuç |
+|---|---|
+| Düz indirme | ✅ `200`, 200 003 B, `audio/mpeg`, `attachment; filename=…` |
+| `Range: bytes=0-1023` | ✅ `206`, 1 024 B, `Content-Range: bytes 0-1023/200003` |
+| 302 → hedef | ✅ `200`, 200 003 B (hop loglandı) |
+| 302 → iç ağ (169.254.169.254) | ✅ `403 URL_NOT_ALLOWED` |
+| Allowlist dışı host | ✅ `403` + yol gösteren `detail` |
+| `/track` (Suno, izin yok) | `download {ready:false, reason:"download_not_authorized"}` → buton pasif |

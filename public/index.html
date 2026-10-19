@@ -485,7 +485,8 @@
 
       const dur = c.duration ? `${Math.round(c.duration)} sn` : '—';
       const ready = c.status === 'complete';
-      const canDownload = ready && c.download_ready !== false;
+      // Buton yalnizca klip tamamlandi VE sunucu "indirme hazir" dediyse aktif.
+      const canDownload = ready && c.download_ready === true;
 
       el.innerHTML = `
         <div class="clip-top">
@@ -498,7 +499,7 @@
         ${ready ? '<audio controls preload="none"></audio>' : ''}
         <div class="clip-actions">
           ${ready ? '<a class="btn btn-ghost btn-sm" download>⬇ MP3 indir</a>' : ''}
-          ${ready && c.download_ready === false ? '<span class="hint" data-dlmsg></span>' : ''}
+          ${ready && c.download_ready !== true ? '<span class="hint" data-dlmsg></span>' : ''}
           <button class="btn btn-ghost btn-sm" data-act="refresh">↻ Durum</button>
           <button class="btn btn-ghost btn-sm" data-act="remove">✕ Kaldır</button>
         </div>
@@ -525,7 +526,15 @@
           a.title = 'Suno bu klip icin indirme izni vermedi';
         }
         const msg = el.querySelector('[data-dlmsg]');
-        if (msg) msg.textContent = 'indirme izni yok (not_authorized)';
+        if (msg) {
+          if (c.download_ready === null)
+            msg.textContent = 'indirme durumu kontrol ediliyor…';
+          else if (c.download_reason === 'download_not_authorized')
+            msg.textContent = 'indirme izni yok (not_authorized)';
+          else if (c.download_reason)
+            msg.textContent = `indirme hazır değil (${c.download_reason})`;
+          else msg.textContent = 'indirme hazır değil';
+        }
       }
 
       el.querySelector('[data-act="refresh"]').onclick = () => pollClip(c.id, 59);

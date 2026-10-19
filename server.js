@@ -137,6 +137,13 @@ const CONFIG = {
     .filter(Boolean),
   // Guvenlik: .suno.ai ve alt alan adlarina da izin ver (ama sadece bu kok icin).
   downloadAllowSunoSubdomains: envBool(process.env.DOWNLOAD_ALLOW_SUNO_SUBDOMAINS, true),
+  // --- Indirme dayanikliligi (Render free tier: soguk baslangic + yavas CDN) ---
+  // Ilk bayt icin ust sinir. 60 sn Render'in 100 sn'lik istek sinirinin altinda kalir.
+  downloadTimeoutMs: envInt(process.env.DOWNLOAD_TIMEOUT_MS, 60000),
+  // Ag hatasi / 5xx icin tekrar deneme sayisi (GET idempotent oldugu icin guvenli).
+  downloadMaxRetries: envInt(process.env.DOWNLOAD_MAX_RETRIES, 2),
+  // Yonlendirme zinciri siniri (her hedef tekrar allowlist'ten gecer).
+  downloadMaxRedirects: envInt(process.env.DOWNLOAD_MAX_REDIRECTS, 5),
   // Yalnizca yerel gelistirme icin: http:// ve IP literal'lerine izin verir.
   // PRODUCTION'DA ASLA true YAPMAYIN.
   downloadAllowHttp: envBool(process.env.DOWNLOAD_ALLOW_HTTP, false),
@@ -320,6 +327,16 @@ async function verifyJwtSignature(token) {
 }
 
 /** Hata mesajindan token/cookie gibi hassas verileri temizler. */
+/**
+ * Log'a yazilacak URL'yi temizle.
+ * api_key / token gibi sorgu parametrelerinin DEGERI asla loglanmaz.
+ */
+function sanitizeUrlForLog(rawUrl) {
+  const raw = String(rawUrl || '');
+  const masked = raw.replace(/([?&](?:api_key|token|key|signature|sig|x-amz-signature)=)([^&\s]+)/gi, '$1<gizli>');
+  return masked.length > 220 ? `${masked.slice(0, 220)}…` : masked;
+}
+
 function sanitizeMessage(message) {
   return String(message || '')
     .replace(/eyJ[A-Za-z0-9._-]{10,}/g, '<token>')
@@ -753,18 +770,20 @@ async function pipeAudioStream(req, res, opts) {
     cookieNames: cookieHeader ? cookieHeader.split(';').map((c) => c.split('=')[0].trim()) : [],
   });
 
-  // --- 2) Upstream'i ac ---
-  const upstream = await axios({
-    method: 'get',
-    url: upstreamUrl,
-    responseType: 'stream',
-    timeout: CONFIG.requestTimeoutMs,
-    maxRedirects: 3,
-    decompress: false,
-    validateStatus: () => true,
-    headers: upstreamHeaders,
-    httpsAgent: getUpstreamAgent(),
-    proxy: false,
+  // --- 2) Upstream'i ac (her yonlendirme adimi allowlist'ten gecer + retry) ---
+  const opened = await openUpstreamStream(upstreamUrl, { headers: upstreamHeaders });
+  const upstream = opened.upstream;
+
+  log('info', 'Upstream acildi.', {
+    finalHost: safeHost(opened.finalUrl),
+    status: upstream.status,
+    hops: opened.hops.length,
+    contentType: upstream.headers['content-type'] || '-',
+  });
+
+  // Baytlarin gercekten aktigini dogrulamak icin ilk parca geldiginde logla.
+  upstream.data.once('data', (chunk) => {
+    log('debug', 'Ilk baytlar geldi.', { bytes: chunk.length, host: safeHost(opened.finalUrl) });
   });
 
   // --- Bos (0 bayt) yanit tespiti ---
@@ -849,7 +868,12 @@ async function pipeAudioStream(req, res, opts) {
     res.setHeader('Content-Type', format === 'wav' ? 'audio/wav' : 'audio/mpeg');
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.setHeader('Access-Control-Allow-Origin', req.get('origin') || '*');
-    res.setHeader('Access-Control-Expose-Headers', 'Content-Type, Content-Disposition, X-Transcode');
+    res.setHeader(
+    'Access-Control-Expose-Headers',
+    'Content-Type, Content-Disposition, Content-Length, Content-Range, Accept-Ranges, X-Transcode, X-Download-Mode',
+  );
+  // Ses calarin seek edebilmesi icin Range destegi oldugunu bildir.
+  if (!res.getHeader('Accept-Ranges')) res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('X-Transcode', `ffmpeg:${format}`);
     res.setHeader('X-Proxy-Mode', proxyMode);
     res.setHeader('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename="${safeName}"`);
@@ -1088,14 +1112,159 @@ function isAllowedDownloadUrl(rawUrl) {
     return { ok: false, reason: 'IP / ic ag adreslerine izin verilmez' };
   }
 
-  const listed = CONFIG.downloadAllowedHosts.includes(host);
+  // --- Host eslesmesi ---
+  // Kurallar:
+  //   1) Tam eslesme:        cdn1.suno.ai
+  //   2) Alt alan adi:       listede "suno.ai" varsa "a.b.suno.ai" de gecer
+  //   3) Nokta oneki:        listede ".suno.ai" yazimi da kabul edilir
+  //   4) Büyük/küçük harf:  ikisi de lowercase'e cevrilerek karsilastirilir
+  const listed = CONFIG.downloadAllowedHosts.some((entryRaw) => {
+    const entry = String(entryRaw || '').trim().toLowerCase().replace(/^\./, '');
+    if (!entry) return false;
+    if (entry === host) return true;
+    // Alt alan adi: "suno.ai" -> "cdn1.suno.ai" (ama "evilsuno.ai" DEGIL)
+    return host.endsWith(`.${entry}`);
+  });
+
   const sunoSub =
     CONFIG.downloadAllowSunoSubdomains && (host === 'suno.ai' || host.endsWith('.suno.ai'));
 
   if (!listed && !sunoSub) {
-    return { ok: false, reason: `Host izinli degil: ${host}` };
+    return {
+      ok: false,
+      reason: `Host izinli degil: ${host}`,
+      // Kullaniciya ne yapacagini soyle: env'i duzelt.
+      hint:
+        'DOWNLOAD_ALLOWED_HOSTS degiskenine bu host\'u ekleyin ' +
+        `(su an izinli: ${CONFIG.downloadAllowedHosts.slice(0, 8).join(', ')}` +
+        (CONFIG.downloadAllowedHosts.length > 8 ? ', …)' : ')'),
+      allowedHosts: CONFIG.downloadAllowedHosts,
+    };
   }
-  return { ok: true, url: parsed.toString() };
+
+  // Standart disi portlar (orn. :8080) icin ek kontrol
+  const port = parsed.port ? Number(parsed.port) : null;
+  // Standart disi portlar yalnizca yerel gelistirme modunda (http izinli) gecer.
+  if (port && port !== 443 && !CONFIG.downloadAllowHttp) {
+    return { ok: false, reason: `Standart disi port: ${port}` };
+  }
+
+  return { ok: true, url: parsed.toString(), host };
+}
+
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/**
+ * Upstream'i acarken:
+ *   - HER yonlendirme hedefini allowlist'ten gecirir (SSRF korumasi)
+ *   - ag hatasi / 5xx icin sinirli sayida tekrar dener
+ *   - ilk bayt icin zaman asimi uygular (Render free tier)
+ *
+ * Dikkat: Govde tuketilmeden once tekrar denenir; boylece bayt kaybi olmaz.
+ *
+ * @returns {Promise<{upstream: import('axios').AxiosResponse, finalUrl: string, hops: Array}>}
+ */
+async function openUpstreamStream(initialUrl, { headers, timeoutMs } = {}) {
+  const timeout = timeoutMs || CONFIG.downloadTimeoutMs;
+  const maxRetries = Math.max(0, CONFIG.downloadMaxRetries);
+
+  const attemptOnce = async () => {
+    let currentUrl = initialUrl;
+    const hops = [];
+
+    for (let hop = 0; hop <= CONFIG.downloadMaxRedirects; hop++) {
+      // (a) Her adimda allowlist kontrolu — yonlendirme hedefi de dahil.
+      const check = isAllowedDownloadUrl(currentUrl);
+      if (!check.ok) {
+        const err = new HttpError(
+          403,
+          'URL_NOT_ALLOWED',
+          `Indirme adresi reddedildi: ${check.reason}`,
+          `${check.hint || ''} url=${sanitizeUrlForLog(currentUrl)} hop=${hop}`.trim(),
+        );
+        throw err;
+      }
+
+      const upstream = await axios({
+        method: 'get',
+        url: check.url,
+        responseType: 'stream',
+        timeout,
+        maxRedirects: 0, // yonlendirmeyi KENDIMIZ takip ediyoruz
+        decompress: false,
+        validateStatus: () => true,
+        headers,
+        httpsAgent: getUpstreamAgent(),
+        proxy: false,
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+      });
+
+      hops.push({ host: check.host, status: upstream.status });
+
+      const location = upstream.headers.location;
+      if (REDIRECT_STATUSES.has(upstream.status) && location) {
+        upstream.data.destroy(); // govdeyi bosalt
+        let nextUrl;
+        try {
+          nextUrl = new URL(location, check.url).toString();
+        } catch (_e) {
+          throw new HttpError(502, 'BAD_REDIRECT', 'Yonlendirme adresi cozumlenemedi.', location.slice(0, 120));
+        }
+        log('info', 'Yonlendirme izleniyor.', {
+          from: check.host,
+          to: safeHost(nextUrl),
+          status: upstream.status,
+          hop: hop + 1,
+        });
+        currentUrl = nextUrl;
+        continue;
+      }
+
+      return { upstream, finalUrl: check.url, hops };
+    }
+
+    throw new HttpError(
+      502,
+      'TOO_MANY_REDIRECTS',
+      `Cok fazla yonlendirme (>${CONFIG.downloadMaxRedirects}).`,
+      sanitizeUrlForLog(initialUrl),
+    );
+  };
+
+  const retryable = (err) => {
+    if (err instanceof HttpError) return false; // 403 vb. tekrar denemek anlamsiz
+    const code = err && err.code;
+    return ['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE'].includes(code) ||
+      (err && err.response && err.response.status >= 500);
+  };
+
+  let lastErr;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await attemptOnce();
+    } catch (err) {
+      lastErr = err;
+      if (attempt === maxRetries || !retryable(err)) break;
+      const backoff = 300 * Math.pow(2, attempt);
+      log('warn', 'Indirme denemesi basarisiz, tekrar denenecek.', {
+        attempt: attempt + 1,
+        code: err.code || '-',
+        backoffMs: backoff,
+      });
+      await sleep(backoff);
+    }
+  }
+  throw lastErr;
+}
+
+/** URL'den sadece host (log icin). */
+function safeHost(rawUrl) {
+  try {
+    return new URL(String(rawUrl)).hostname;
+  } catch (_e) {
+    return '-';
+  }
 }
 
 /**
@@ -2928,6 +3097,15 @@ app.get('/track/:id', apiKeyGuard, async (req, res) => {
           detail: sanitizeMessage(dlErr.detail || dlErr.message),
         };
       }
+    } else if (track.is_complete && typeof provider.getAudioBuffer === 'function') {
+      // Saglayici sesi bayt olarak veriyor (Google Lyria, reapi...): indirme hazir.
+      download = {
+        ready: true,
+        mode: 'memory',
+        format: 'mp3',
+        proxy_path: `/download?id=${encodeURIComponent(clipId)}`,
+        stream_path: `/stream/${encodeURIComponent(clipId)}`,
+      };
     } else if (track.is_complete) {
       download = { ready: false, reason: 'provider_has_no_download_api' };
     }
@@ -2960,6 +3138,32 @@ app.get('/track/:id', apiKeyGuard, async (req, res) => {
 //
 //  Not: Istemci URL verirken SSRF korumasi devrede (bkz. isAllowedDownloadUrl).
 // ---------------------------------------------------------------------------
+/**
+ * INDIRME/STREAM ERISIM LOGU
+ * --------------------------
+ * Her istek icin: yol (api_key gizlenmis), durum kodu, mod, bayt, sure.
+ * Hata durumunda sendError'in urettigi kod da bu satirda gorunur.
+ * API anahtari ASLA loglanmaz (sanitizeUrlForLog).
+ */
+app.use((req, res, next) => {
+  if (!/^\/(download|stream)(\/|$)/.test(req.path)) return next();
+  const startedAt = Date.now();
+  res.on('finish', () => {
+    const mode =
+      res.getHeader('X-Download-Mode') || res.getHeader('X-Proxy-Mode') || res.getHeader('X-Transcode') || '-';
+    log(res.statusCode >= 400 ? 'warn' : 'info', 'Ses istegi tamamlandi.', {
+      method: req.method,
+      path: sanitizeUrlForLog(req.originalUrl),
+      status: res.statusCode,
+      mode,
+      length: res.getHeader('Content-Length') || '-',
+      contentType: res.getHeader('Content-Type') || '-',
+      ms: Date.now() - startedAt,
+    });
+  });
+  next();
+});
+
 app.get('/download', apiKeyGuard, async (req, res) => {
   try {
     const inline = req.query.inline === '1' || req.query.inline === 'true';
@@ -2975,6 +3179,25 @@ app.get('/download', apiKeyGuard, async (req, res) => {
     let forceTransparent = false;  // transparent kaynakta transcode yapilmaz
     let handshakeSessionId = null; // handshake'ten gelen analytics session id
     let requestedFormat = null;    // saglayicidan gelen sesin istenen formati
+
+    // --- (A0a) ERKEN ALLOWLIST KONTROLU ---
+    // url parametresi ile gelindiyse, cagri zincirine girmeden net 403 don.
+    if (targetUrl) {
+      const pre = isAllowedDownloadUrl(targetUrl);
+      if (!pre.ok) {
+        log('warn', 'Indirme adresi allowlist disinda.', {
+          host: safeHost(targetUrl),
+          reason: pre.reason,
+        });
+        return sendError(
+          res,
+          403,
+          'URL_NOT_ALLOWED',
+          `Indirme adresi reddedildi: ${pre.reason}`,
+          pre.hint || undefined,
+        );
+      }
+    }
 
     // --- (A) id verildiyse: feed'den gercek ses adresini coz ---
     if (!targetUrl && req.query.id) {
