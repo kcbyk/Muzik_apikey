@@ -1650,3 +1650,32 @@ GEMINI_WEB_COOKIES=__Secure-1PSID=...; __Secure-1PSIDTS=...; ...
 Cevap içinden base64 (`ID3`/`RIFF` imzası) veya `googleusercontent.com` ses URL'si
 çıkarılır; baytlar belleğe alınır ve **kendi indirme sistemimizden** servis edilir
 (`/download?id=…`, `Range` destekli). Dışarıya URL sızdırılmaz.
+
+### 30.5 Replay modu (en pratik yol)
+
+Gemini'nin iç payload'ı sık değişiyor; bu yüzden **yakalanan isteği birebir
+tekrarlama** modu var. Suno'da kazandıran yöntemin aynısı.
+
+```text
+1) gemini.google.com'da müzik üret (Create music / "…beat yap")
+2) F12 > Network > filtre: batchexecute
+3) Ses dönen isteği bul (Response sekmesinde base64 ya da googleusercontent .mp3)
+4) Sağ tık > Copy as cURL (bash)
+5) Dosyaya kaydet: /tmp/gemini-music.curl
+6) Render env:
+     GEMINI_WEB_CURL_FILE=/tmp/gemini-music.curl
+     GEMINI_WEB_CAPTURED_PROMPT=<yakalarken yazdığın prompt>
+     GEMINI_WEB_COOKIES=__Secure-1PSID=…; __Secure-1PSIDTS=…
+```
+
+Kod, cURL'ü ayrıştırır (`parseCurl`), içindeki prompt metnini yenisine çevirir
+(ham ve yüzde-kodlu hâli), isteği gönderir ve cevaptaki base64 sesi çıkarır.
+
+### 30.6 Doğrulanan durum (2026-10-19)
+
+| Adım | Sonuç |
+|---|---|
+| `GET /app` + kullanıcı çerezleri | ✅ `200`, `SNlM0e` / `cfb2h` / `fDrFJe` alındı |
+| `batchexecute?rpcids=ESY5D` | ✅ `200` — `[[null,null,null,null,true]]` (özellik bayrağı) |
+| `parseCurl` + replay | ✅ cURL ayrıştırıldı, prompt değiştirildi, istek gitti |
+| Müzik üretim RPC'si | ⏳ yakalanması bekleniyor (`GEMINI_WEB_CURL_FILE`) |

@@ -114,27 +114,90 @@ async function bootstrap() {
 }
 
 /**
+ * Yakalanmis bir "Copy as cURL (bash)" metnini ayristir.
+ * Desteklenen: curl 'URL' -H 'k: v' --data-raw '...'  |  -X POST
+ * Donen: { method, url, headers, body }
+ */
+function parseCurl(text) {
+  const src = String(text || '');
+  const joinContinuations = src.replace(/\\\r?\n/g, ' ').replace(/\^\r?\n/g, ' ');
+  const urlMatch = joinContinuations.match(/curl\s+(?:-X\s+\w+\s+)?['"]?(https?:\/\/[^'"\s]+)['"]?/);
+  if (!urlMatch) return null;
+  const url = urlMatch[1];
+
+  const methodMatch = joinContinuations.match(/-X\s+(\w+)/);
+  const method = (methodMatch ? methodMatch[1] : 'POST').toUpperCase();
+
+  const headers = {};
+  const headerRe = /-H\s+(['"])([^'"]*?)\1/g;
+  let m;
+  while ((m = headerRe.exec(joinContinuations))) {
+    const raw = m[2];
+    const idx = raw.indexOf(':');
+    if (idx > 0) headers[raw.slice(0, idx).trim()] = raw.slice(idx + 1).trim();
+  }
+
+  let body = null;
+  const bodyMatch =
+    joinContinuations.match(/--data-raw\s+(['"])([\s\S]*?)\1/) ||
+    joinContinuations.match(/--data(?:-binary)?\s+(['"])([\s\S]*?)\1/);
+  if (bodyMatch) body = bodyMatch[2];
+
+  return { method, url, headers, body };
+}
+
+/** Sablonu dosyadan (JSON veya ham cURL) yukle. */
+function loadTemplate() {
+  const p = String(process.env.GEMINI_WEB_REQUEST_TEMPLATE || process.env.GEMINI_WEB_CURL_FILE || '').trim();
+  if (!p || !fs.existsSync(p)) return null;
+  const raw = fs.readFileSync(p, 'utf8');
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      return JSON.parse(trimmed);
+    } catch (_e) {
+      return null;
+    }
+  }
+  return parseCurl(raw);
+}
+
+/**
  * Yakalanmis istek sablonunu (Copy as cURL / fetch) tekrar oynat.
  * Sablon icindeki prompt metni GEMINI_WEB_PROMPT_PLACEHOLDER ile degistirilir.
  */
 async function replayTemplate(prompt) {
-  const p = String(process.env.GEMINI_WEB_REQUEST_TEMPLATE || '').trim();
-  if (!p || !fs.existsSync(p)) return null;
-
   let tpl;
   try {
-    tpl = JSON.parse(fs.readFileSync(p, 'utf8'));
+    tpl = loadTemplate();
   } catch (err) {
     throw new ProviderError(500, 'GEMINI_WEB_TEMPLATE_INVALID', 'Istek sablonu okunamadi.', err.message);
   }
+  if (!tpl || !tpl.url) return null;
 
+  // Prompt degistirme: once __PROMPT__ yer tutucusu, yoksa yakalanan prompt metni.
+  let body = String(tpl.body || '');
   const placeholder = String(process.env.GEMINI_WEB_PROMPT_PLACEHOLDER || '__PROMPT__');
-  const body = String(tpl.body || '').split(placeholder).join(encodeURIComponent(prompt));
+  const captured = String(process.env.GEMINI_WEB_CAPTURED_PROMPT || '').trim();
+
+  if (body.includes(placeholder)) {
+    body = body.split(placeholder).join(encodeURIComponent(prompt));
+  } else if (captured) {
+    const enc = encodeURIComponent(captured);
+    body = body.split(enc).join(encodeURIComponent(prompt));
+    body = body.split(captured).join(prompt);
+    body = body.split(encodeURIComponent(JSON.stringify(captured)).replace(/%22/gi, '%22'))
+               .join(encodeURIComponent(JSON.stringify(prompt)));
+  }
+
+  // Sablonun kendi Cookie basligi varsa onu kullan, yoksa env cerezleri.
+  const headers = { ...(tpl.headers || {}) };
+  if (!Object.keys(headers).some((h) => h.toLowerCase() === 'cookie')) headers.Cookie = cookies();
 
   const { data } = await axios.request({
     method: tpl.method || 'POST',
     url: tpl.url,
-    headers: { ...(tpl.headers || {}), Cookie: cookies() },
+    headers,
     data: body,
     timeout: Math.max(60000, Number(process.env.GOOGLE_TIMEOUT_MS || 240000)),
     validateStatus: () => true,
