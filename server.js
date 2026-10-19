@@ -2013,10 +2013,27 @@ async function sunoRequest(method, path, body) {
 
   let response = await execute(false);
 
-  // 401/403: yalnizca gercekten yenileyebiliyorsak (__client varsa) tekrar dene.
-  if ((response.status === 401 || response.status === 403) && CONFIG.refreshToken) {
-    log('warn', `Suno API ${response.status} dondurdu, token zorla yenilenip tekrar denenecek.`, path);
+  // Token gecersizligi: 401/403 VE 422 token_validation_failed.
+  // 422'yi de yakaliyoruz cunku Suno taze olmayan JWT icin 422 donuyor.
+  const bodyText = typeof response.data === 'string' ? response.data : JSON.stringify(response.data || {});
+  const tokenRejected =
+    response.status === 401 ||
+    response.status === 403 ||
+    (response.status === 422 && /token_validation_failed|verify your request/i.test(bodyText));
+
+  if (tokenRejected && CONFIG.refreshToken) {
+    log('warn', `Suno API ${response.status} (token reddi), zorla yenile + tekrar dene.`, path);
     response = await execute(true);
+  } else if (tokenRejected && !CONFIG.refreshToken) {
+    // Yenileme yolu yok: kullaniciya ne yapacagini net soyle.
+    const e = new Error('Suno oturumu gecersiz. Taze token gerekli.');
+    e.status = 401;
+    e.code = 'SESSION_EXPIRED';
+    e.detail =
+      'SUNO_REFRESH_TOKEN (__client cookie) tanimli degil, bu yuzden otomatik yenileme yapilamiyor. ' +
+      'Cozum: DevTools > Application > Cookies > clerk.suno.com > __client degerini SUNO_REFRESH_TOKEN ' +
+      'olarak ekle; sonrasinda token otomatik yenilenir. Alternatif: /auth/token ile taze JWT gonder.';
+    throw e;
   }
 
   if (response.status < 200 || response.status >= 300) {
@@ -2362,6 +2379,9 @@ app.get('/health', (_req, res) => {
     memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
     auth: {
       hasRefreshToken: Boolean(CONFIG.refreshToken),
+      // full = sunucu token'i kendi yeniler (__client var)
+      // manual = yalnizca yapistirilmis JWT var, suresi dolunca durur
+      refreshMode: CONFIG.refreshToken ? 'full' : CONFIG.sessionToken ? 'manual' : 'none',
       hasSessionToken: Boolean(CONFIG.sessionToken),
       hasAccessToken: Boolean(authState.accessToken),
       sessionId: authState.sessionId,

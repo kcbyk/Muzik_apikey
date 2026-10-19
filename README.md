@@ -1289,3 +1289,71 @@ Dashboard'da buton **soluk/pasif** olur, yanında `indirme izni yok (not_authori
 `422 token_validation_failed` döner. İndirme (`/api/download/clip`) ise geçerli
 herhangi bir token'la çalışır. Bu yüzden üretimden hemen önce tokunun taze
 olması gerekir (konsol snippet'i).
+
+---
+
+## 24. 🔑 Token sorunu: gerçek sınır ve otomatik yenileme
+
+### 24.1 Neden token gerekiyor?
+
+Suno'nun **herkese açık bir API'si yok**. (Temmuz 2026'da "geliştirici API'si
+araştırıyoruz" açıklaması yapıldı; Ekim 2026 itibarıyla self-servis API,
+dokümantasyon veya fiyat listesi yayınlanmadı.) Dolayısıyla her "Suno API"
+projesi gibi bu proxy de **web oturumunuzu** kullanır. Oturum JWT'si ~60 dk yaşar.
+
+### 24.2 Ölçtüğüm gerçek (yerel test)
+
+| Yol | Sonuç |
+|---|---|
+| `__session` JWT ile `/v1/client` | `sessions: []` — Clerk oturumu tanımıyor |
+| `__session` ile `POST /v1/client/sessions/{id}/tokens` | **session id yok → 404/yok** |
+| `Suno.com` üzerinden Clerk proxy (`/v1/client`, `/api/__clerk/…`) | `404` / `400` — proxy yok |
+| `Authorization: Bearer` ile `/v1/me` | `404` |
+
+**Sebep:** Clerk, JWT üretmek için HttpOnly **`__client`** çerezini istiyor.
+`__session` bu iş için yetmiyor. `__client` JavaScript'ten okunamaz
+(`document.cookie`'de görünmez) **ama DevTools'ta görünür.**
+
+### 24.3 Çözüm: bir kez `__client`, sonra tam otomatik
+
+```text
+1) suno.com'da giriş yap
+2) F12 > Application > Cookies > https://clerk.suno.com
+3) __client satırını bul (HttpOnly kolonu ✓ olacak, bu normal)
+4) Değeri kopyala (client_xxx... ile başlar)
+5) Render > Environment > SUNO_REFRESH_TOKEN = <kopyaladığın değer>
+6) Redeploy
+```
+
+Sonrasında sunucu **her 15 dakikada** `sessions/{id}/touch` + `tokens` çağırıp
+JWT'yi kendi yeniler. `/health` içinde `auth.refreshMode: "full"` görürsün.
+Kod tarafı zaten hazır — `keepAliveTick()` + `refreshAccessToken()`.
+
+### 24.4 `refreshMode` değerleri
+
+| Değer | Anlam |
+|---|---|
+| `full` | `__client` var → token otomatik yenileniyor (istenen) |
+| `manual` | Yalnızca yapıştırılmış JWT var → ~60 dk sonra durur |
+| `none` | Kimlik yok |
+
+### 24.5 Token reddedilirse
+
+Suno 422 `token_validation_failed` dönerse proxy artık:
+1. `SUNO_REFRESH_TOKEN` varsa **zorla yenileyip tekrar dener**,
+2. yoksa `401 SESSION_EXPIRED` + ne yapılacağını söyleyen `detail` döner.
+
+### 24.6 Üretim (uygulamaya entegre ederken) önerisi
+
+Kendi ürününde beat üretimi kritikse, oturum çerezine bağlı bir yol tek başına
+yeterli değildir. `AUDIO_PROVIDER` katmanı bunun için var:
+
+| Sağlayıcı | Kimlik | Yaklaşık maliyet |
+|---|---|---|
+| `replicate` (MusicGen / Stable Audio) | API token (kalıcı) | ~$0.03–0.20 / parça |
+| `elevenlabs` | API key | plana göre |
+| `suno` | web oturumu | abonelik |
+| `mock` | yok | 0 (test) |
+
+`AUDIO_PROVIDER=replicate` + `REPLICATE_API_TOKEN=…` ile aynı `/generate-beat`,
+`/track`, `/download` uçları çalışır; istemci kodunda **hiçbir değişiklik olmaz**.
