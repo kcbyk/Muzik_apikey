@@ -1445,3 +1445,55 @@ Kredi 0 olsa da üretim çalıştı (ücretsiz günlük kota). İndirme için pl
 |---|---|---|
 | `OUT_OF_CREDITS` | 402 | bakiye 0 (generate reddedildi) |
 | `TOKEN_REJECTED` | 422 | token reddedildi, bakiye ektedir |
+
+---
+
+## 27. 🏁 TAM OTOMATİK: `__client` ile sıfır manuel token
+
+### 27.1 Kanıt (canlı, Render)
+
+```json
+GET /health → auth: { refreshMode: "full",
+                      sessionId: "session_19679b19a8d210ff482e0f",
+                      tokenExpiresInSeconds: 3495,
+                      refreshCount: 1 }
+POST /generate-beat → ok: true, klipler: e730e0ab…, 5e02a606…
+GET  /track/…      → complete, 63.16 sn
+```
+
+`SUNO_SESSION_TOKEN` **boş**. Elle yapıştırılmış token yok; sunucu token'ı
+`__client` çerezinden kendi üretiyor.
+
+### 27.2 `__client` nereden alınır (tek sefer, ~1 yıl geçerli)
+
+```text
+1) https://auth.suno.com/v1/client?_clerk_js_version=5.35.0  adresini aç
+   (JSON döker; oturum birinci taraf olduğu için çerezler görünür)
+2) F12 > Application > Cookies > https://auth.suno.com
+3) __client satırının Value'sunu kopyala  (eyJ… ile başlar, "refresh" JWT'si)
+4) SUNO_REFRESH_TOKEN = o değer  →  redeploy
+```
+
+Yenileme zinciri (kodda: `keepAliveTick()`):
+
+```
+Cookie: __client=<refresh JWT>
+  GET  https://auth.suno.com/v1/client                     → session_xxx
+  POST https://auth.suno.com/v1/client/sessions/{id}/tokens → { jwt }  (60 dk)
+  POST https://auth.suno.com/v1/client/sessions/{id}/touch
+tekrar: her 15 dakikada bir
+```
+
+### 27.3 Ölçülen ömürler
+
+| Kimlik | Nerede | Ömür |
+|---|---|---|
+| `__client` (refresh) | `auth.suno.com` (HttpOnly) | **exp 2027-10-19** |
+| Clerk oturumu | `session_19679b…` | `expire_at` 2027 |
+| Erişim JWT'si | her 15 dk üretilir | ~60 dk |
+
+### 27.4 Kalan tek sınır: indirme (plan)
+
+`is_download_unlocked: false` → `/download` = `409 CLIP_ENCRYPTED`.
+Bu **Suno'nun plan kısıtı**; proxy bayt üretmez/açmaz. Pro planda bayrak
+`true` olur ve aynı akış otomatik indirir (Pro hesapta ölçüldü: 3 764 184 B).
