@@ -2048,6 +2048,9 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1); // Render / reverse proxy arkasinda dogru IP
 app.use(express.json({ limit: '64kb' })); // kucuk limit -> dusuk bellek
+// text/plain: tarayici konsolundan mode:'no-cors' ile gonderilen govdeler icin.
+// (application/json preflight tetikler; text/plain tetiklemez -> CORS'a takilmaz)
+app.use(express.text({ type: 'text/plain', limit: '32kb' }));
 
 /** Basit istek loglama (UptimeRobot trafigini gurultuye bogmamak icin /ping haric). */
 app.use((req, _res, next) => {
@@ -2258,9 +2261,24 @@ app.post('/auth/refresh', apiKeyGuard, async (_req, res) => {
 //   Body: { "token": "eyJ..." }   (tarayicida: await window.Clerk.session.getToken())
 // ---------------------------------------------------------------------------
 app.post('/auth/token', apiKeyGuard, async (req, res) => {
-  const token = typeof (req.body && req.body.token) === 'string' ? req.body.token.trim() : '';
+  // Govde 3 sekilde gelebilir:
+  //   1) { "token": "eyJ..." }          (JSON — curl/panel)
+  //   2) "eyJ..."                        (text/plain — konsoldan no-cors)
+  //   3) ?token=eyJ...                   (query — bazi istemciler)
+  let body = req.body;
+  if (typeof body === 'string') {
+    const trimmed = body.trim();
+    try {
+      const parsed = JSON.parse(trimmed);
+      body = parsed && typeof parsed === 'object' ? parsed : { token: trimmed };
+    } catch (_e) {
+      body = { token: trimmed };
+    }
+  }
+  const rawToken = (body && body.token) || req.query.token || '';
+  const token = typeof rawToken === 'string' ? rawToken.trim() : '';
   if (!token || !token.includes('.')) {
-    return sendError(res, 400, 'INVALID_TOKEN', '{ "token": "<JWT>" } bekleniyor.');
+    return sendError(res, 400, 'INVALID_TOKEN', 'JWT bekleniyor: {"token":"eyJ..."} veya düz "eyJ..." govdesi.');
   }
 
   // --- Imza dogrulamasi: bozuk/sahte token'i Suno'ya gondermeden yakala ---
