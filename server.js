@@ -1128,8 +1128,9 @@ function isAllowedDownloadUrl(rawUrl) {
 
   const sunoSub =
     CONFIG.downloadAllowSunoSubdomains && (host === 'suno.ai' || host.endsWith('.suno.ai'));
+  const cloudfrontSub = host === 'cloudfront.net' || host.endsWith('.cloudfront.net');
 
-  if (!listed && !sunoSub) {
+  if (!listed && !sunoSub && !cloudfrontSub) {
     return {
       ok: false,
       reason: `Host izinli degil: ${host}`,
