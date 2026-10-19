@@ -1181,11 +1181,26 @@ async function runStreamHandshake(clipId) {
 function buildUpstreamCookieHeader(token) {
   if (!CONFIG.forwardCookies) return null;
 
+  // NOT: Cookie jar'i oldugu gibi gondermek YANLIS sonuc veriyordu.
+  // Jar icindeki eski __session, yeni Authorization token'iyla celisince Suno
+  // 422 token_validation_failed donduruyor. Bu yuzden jar'daki oturum
+  // cerezlerini atlayip guncel token'i kendimiz yaziyoruz.
+  const parts = [];
+
   if (CONFIG.cookieJar) {
-    return CONFIG.cookieJar.replace(/^\s*cookie:\s*/i, '').trim();
+    const raw = CONFIG.cookieJar.replace(/^\s*cookie:\s*/i, '').trim();
+    for (const pair of raw.split(';')) {
+      const item = pair.trim();
+      if (!item) continue;
+      const name = item.split('=')[0].trim().toLowerCase();
+      // oturum cerezleri HER ZAMAN guncel token'dan uretilir
+      if (name === '__session' || name.startsWith('__session_')) continue;
+      if (name === '__client' || name.startsWith('__client_uat')) continue;
+      if (name === 'suno_device_id') continue;
+      parts.push(item);
+    }
   }
 
-  const parts = [];
   const refresh = CONFIG.refreshToken;
   if (refresh) {
     if (refresh.includes('__client=')) {
