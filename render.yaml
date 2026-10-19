@@ -1,0 +1,45 @@
+# Render Blueprint - https://render.com/docs/blueprint-spec
+# Kullanim:  Render > New > Blueprint  ->  bu repoyu secin.
+#
+# ZORUNLU ORTAM DEGISKENLERI (panelden girilir, repoya YAZILMAZ):
+#   SUNO_REFRESH_TOKEN   -> Suno/Clerk __client cerezi
+#   ALLOWED_API_KEYS     -> virgulle ayrilmis API anahtari listesi
+services:
+  - type: web
+    name: suno-beat-proxy
+    runtime: node
+    plan: free
+    region: frankfurt          # TR icin en yakin bolge
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /ping
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # 512 MB instance icin guvenli heap tavani
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=384
+      - key: SUNO_API_BASE
+        value: https://studio-api-prod.suno.com
+      - key: SUNO_GENERATE_PATH
+        value: /api/generate/v2-web/
+      - key: CLERK_BASE_URL
+        value: https://clerk.suno.com
+      - key: KEEPALIVE_INTERVAL_MS
+        value: "900000"
+      # Saglayici secimi (suno | replicate | elevenlabs | mock)
+      - key: AUDIO_PROVIDER
+        value: suno
+      # Imza motoru (bos spec = derive kapali)
+      - key: SIGNER_ENABLED
+        value: "true"
+      - key: SIGNER_POOL_ENABLED
+        value: "true"
+
+      # --- Sir olarak panelden girilecek (sync: false) ---
+      - key: SUNO_REFRESH_TOKEN
+        sync: false
+      # x-api-key / ?api_key= ile eslesecek anahtar listesi
+      - key: ALLOWED_API_KEYS
+        sync: false

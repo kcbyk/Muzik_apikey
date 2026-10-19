@@ -1,0 +1,479 @@
+{
+  "ok": true,
+  "scanned_files": 60,
+  "scanned_bytes": 3726681,
+  "elapsed_ms": 34,
+  "score": 1,
+  "verdict": "IMZA IZI YOK: taranan bundle icinde akis/audiopipe URL'sini imzalayan bir kod (sig / signature / HMAC / subtle.sign) bulunmadi. Bulunan HMAC/SHA-256 cagrilari yalnizca AWS S3 presign (SigV4) dosyasinda: https://suno.com/_next/static/immutable/chunks/0ni3ufxqiy6dy.js, https://suno.com/_next/static/immutable/chunks/3wl712nemn6-u.js. Buna karsilik DRM/lisans yolu MEVCUT: icerik AES ile sifreli, anahtar /api/mango/rights lisans ucundan geliyor. Yani eksik olan sey imza degil, cozme anahtari.",
+  "findings": [
+    {
+      "rule": "url_searchparams",
+      "label": "URLSearchParams ile URL kurulumu",
+      "klass": "usage",
+      "files": 9,
+      "occurrences": 20,
+      "evidence": [
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/14oy18do5pjaq.js",
+          "snippet": "sentry_key=e.publicKey),n&&(o.sentry_client=`${n.name}/${n.version}`),new URLSearchParams(o).toString()}`},\"Z\",0,function(e,n){let o=(0,t.p)(e);if(!o)return\"\";let a=`${r(o)}embed/e"
+        },
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/0cfekxq034c5o.js",
+          "snippet": "84);e.r(334323);let c=e.r(570621),s=e.r(339826);function f(e){let t=R(new URLSearchParams(e));return(0,s.getRenderedSearch)(t)}function d(e){let t=e.headers.get(o.NEXT_REWRITTEN_QU"
+        },
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/2uhu7u7rigzsy.js",
+          "snippet": ",0,a,\"L\",0,function(e){if(!(0,i.default)(\"localStorage\"))return;let n=new URLSearchParams(e);if(!c(n))return;let t={};for(let e of l){let i=n.get(e);i&&(t[e]=i)}let a={...t,landing"
+        },
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/3w1p_8p7q7ofo.js",
+          "snippet": "k\")}}),d}var s=e.i(863406),l=e.i(870357);function c(e,r,a,i={}){let s=new URLSearchParams({contentId:e,src:r,contentType:a}),l=(0,n.f)(i.muffleAfter);return void 0!==l&&(s.set(t.h,"
+        },
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/3wl712nemn6-u.js",
+          "snippet": ").then(eh)}getUploadParameters(t,e){let{meta:r}=t,{type:i,name:o}=r,s=new URLSearchParams({filename:o,type:i,...ec({meta:r,allowedMetaFields:this.opts.allowedMetaFields,querify:!0}"
+        },
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/2z35yzihoi9d_.js",
+          "snippet": "dow.location.origin,a=document.referrer||null,c=t?new URLSearchParams:new URLSearchParams(i);c.set(\"auth_mode\",e);let l=new URLSearchParams(c),u=t||c.get(\"redirect_url\")||o.FR.Crea"
+        }
+      ]
+    },
+    {
+      "rule": "aws_sigv4",
+      "label": "AWS SigV4 (S3 presign) — yanlis pozitif",
+      "klass": "false-positive",
+      "files": 2,
+      "occurrences": 6,
+      "evidence": [
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/0ni3ufxqiy6dy.js",
+          "snippet": ".length>3)}(t.hostname))return!1;let a=t.searchParams;return!!(a.get(\"X-Amz-Signature\")&&a.get(\"X-Amz-Credential\")||a.get(\"Signature\")&&a.get(\"AWSAccessKeyId\"))}catch{return!1}}fun"
+        },
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/3wl712nemn6-u.js",
+          "snippet": "oISOString().replace(/[-:]|\\.\\d+/g,\"\"),f=c.slice(0,8),m=`${f}/${a}/s3/aws4_request`,y=new URL(`https://${p}${h}`);y.searchParams.set(\"X-Amz-Algorithm\",\"AWS4-HMAC-SHA256\"),y.searchP"
+        }
+      ]
+    },
+    {
+      "rule": "drm_aes",
+      "label": "Icerik sifreleme (AES-CTR / AES-GCM)",
+      "klass": "drm",
+      "files": 1,
+      "occurrences": 5,
+      "evidence": [
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/1jho8g9y2zlb7.js",
+          "snippet": "tle.digest(\"SHA-256\",t);return crypto.subtle.importKey(\"raw\",n,{name:\"AES-GCM\"},!1,[\"decrypt\"])}async function r(e,t){if(e)return e;if(!t)throw Error(\"License server response is mi"
+        }
+      ]
+    },
+    {
+      "rule": "audiopipe_ref",
+      "label": "audiopipe referansi",
+      "klass": "usage",
+      "files": 2,
+      "occurrences": 3,
+      "evidence": [
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/3w1p_8p7q7ofo.js",
+          "snippet": "timestamp:Date.now(),elapsedMs:0}),r.f.log(\"SW: using passthrough for audiopipe content\"),{url:n,swMuffleActive:!1}}f?.({mode:\"sw\",bytesLoaded:0,bytesTotal:0,bytesDecrypted:0,chunk"
+        },
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/0_o7acn6o3nau.js",
+          "snippet": "t.net\"]);function l(e){let t;try{t=new URL(e)}catch{return!1}return/^(audiopipe|audiopipe-dev)\\./.test(t.hostname)||s.has(t.hostname)}function u(e,t){if(!e||0===e.length)return nul"
+        }
+      ]
+    },
+    {
+      "rule": "drm_guest_token",
+      "label": "Anonim oynatma lisans token'i (glt / guest token)",
+      "klass": "drm",
+      "files": 1,
+      "occurrences": 2,
+      "evidence": [
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/1jho8g9y2zlb7.js",
+          "snippet": "(e)return e;if(!t)throw Error(\"License server response is missing the guest token for anonymous playback\");return n(t)}async function i(e,t,n){return new Uint8Array(await crypto.su"
+        }
+      ]
+    },
+    {
+      "rule": "sw_passthrough",
+      "label": "Service Worker passthrough URL builder",
+      "klass": "usage",
+      "files": 1,
+      "occurrences": 1,
+      "evidence": [
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/3w1p_8p7q7ofo.js",
+          "snippet": " e,n=(e=new URLSearchParams({contentId:o,src:a,contentType:d}),`${t.H}/passthrough?${e.toString()}`);return f?.({mode:\"sw\",bytesLoaded:0,bytesTotal:0,bytesDecrypted:0,chunksAvailab"
+        }
+      ]
+    },
+    {
+      "rule": "drm_license",
+      "label": "DRM lisans ucu (/api/mango/rights)",
+      "klass": "drm",
+      "files": 1,
+      "occurrences": 1,
+      "evidence": [
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/1jho8g9y2zlb7.js",
+          "snippet": "k)(async()=>{await s.o.acquire();let{response:n,data:r}=await e.POST(\"/api/mango/rights\",{body:{content_params:{content_id:t,content_type:i}},credentials:c?\"same-origin\":\"include\"}"
+        }
+      ]
+    },
+    {
+      "rule": "crypto_sign",
+      "label": "WebCrypto imzalama cagrisi (subtle.sign / HMAC)",
+      "klass": "signing-api",
+      "files": 1,
+      "occurrences": 1,
+      "evidence": [
+        {
+          "file": "https://suno.com/_next/static/immutable/chunks/3wl712nemn6-u.js",
+          "snippet": "e operation was aborted\",{cause:t.reason})}let tB=new TextEncoder,tW={name:\"HMAC\",hash:\"SHA-256\"};async function tX(t){let{subtle:e}=globalThis.crypto;return e.digest(tW.hash,tB.en"
+        }
+      ]
+    }
+  ],
+  "per_file": [
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2pd-tr47lruiv.js",
+      "size": 31085,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2tn9d3culgyfo.js",
+      "size": 18601,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/14oy18do5pjaq.js",
+      "size": 32981,
+      "rules": [
+        "url_searchparams"
+      ]
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/3yefwr9ethw2f.js",
+      "size": 18457,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/0cfekxq034c5o.js",
+      "size": 159084,
+      "rules": [
+        "url_searchparams"
+      ]
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/0ibwgkf_937z7.js",
+      "size": 207623,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/1ox77x5jhheyd.js",
+      "size": 228665,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/0aw-8_chf2mws.js",
+      "size": 18415,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2le8412isdu1e.js",
+      "size": 112161,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/turbopack-2ihhr7iq83pua.js",
+      "size": 11656,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/1wgw_nrvh2b20.js",
+      "size": 13773,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2j3sycvl9fym4.js",
+      "size": 20840,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/3w_nhb-nm-jv-.js",
+      "size": 6366,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/44t_4au2rvu6m.js",
+      "size": 16912,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/0kzluxsx81dd1.js",
+      "size": 27709,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/3buexipl-2iv2.js",
+      "size": 20196,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/43823esen9bub.js",
+      "size": 19824,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/416n9vv1gy-ar.js",
+      "size": 31594,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2uhu7u7rigzsy.js",
+      "size": 24621,
+      "rules": [
+        "url_searchparams"
+      ]
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/1rnk3y2rldi16.js",
+      "size": 16371,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/0ni3ufxqiy6dy.js",
+      "size": 27371,
+      "rules": [
+        "aws_sigv4"
+      ]
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/3nuhtbf-ynjxv.js",
+      "size": 32753,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/0m1lrbfweh28r.js",
+      "size": 20867,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/3w1p_8p7q7ofo.js",
+      "size": 24151,
+      "rules": [
+        "audiopipe_ref",
+        "sw_passthrough",
+        "url_searchparams"
+      ]
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/20uf572si6llk.js",
+      "size": 30858,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/1ke3-dvnyuy7x.js",
+      "size": 30802,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/3pmlsybalk0pw.js",
+      "size": 24027,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/33t6br08iznnx.js",
+      "size": 30416,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/1q2nqazv1-xiy.js",
+      "size": 19059,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/02l04z0-xk1r7.js",
+      "size": 32403,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/0_o7acn6o3nau.js",
+      "size": 24726,
+      "rules": [
+        "audiopipe_ref"
+      ]
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/27ih-9w7brecd.js",
+      "size": 57245,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/1jho8g9y2zlb7.js",
+      "size": 24973,
+      "rules": [
+        "drm_license",
+        "drm_aes",
+        "drm_guest_token"
+      ]
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/3wl712nemn6-u.js",
+      "size": 59697,
+      "rules": [
+        "crypto_sign",
+        "aws_sigv4",
+        "url_searchparams"
+      ]
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/0-2nlajw2hiq2.js",
+      "size": 26153,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/3r8qc553r2cqk.js",
+      "size": 23031,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/0rp44efi2c9lr.js",
+      "size": 23548,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2z35yzihoi9d_.js",
+      "size": 27886,
+      "rules": [
+        "url_searchparams"
+      ]
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/0hphh_sk0yrxf.js",
+      "size": 28433,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/3t5-1sfby--e7.js",
+      "size": 34123,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2i8lrlwai9e9c.js",
+      "size": 35472,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/40xhulzqpf9hm.js",
+      "size": 99876,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2gilclqpd-9ml.js",
+      "size": 44854,
+      "rules": [
+        "url_searchparams"
+      ]
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/43ff9go52ux8w.js",
+      "size": 28716,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/049j6wg9rdfpv.js",
+      "size": 45156,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/3z3sh34kriixa.js",
+      "size": 33423,
+      "rules": [
+        "url_searchparams"
+      ]
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/241ybomh_p1ua.js",
+      "size": 24957,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2s6svw00yq03a.js",
+      "size": 113214,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2hgjcz6wgu2c2.js",
+      "size": 40548,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2uv-qdm-0aanh.js",
+      "size": 83974,
+      "rules": [
+        "url_searchparams"
+      ]
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/35vk34r3j6c76.js",
+      "size": 39665,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2v661kx-nr3as.js",
+      "size": 226478,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/0ok9xm7gygi8j.js",
+      "size": 103988,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/3p-fhvvkpuh7o.js",
+      "size": 112332,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/0bic9z0aa2fki.js",
+      "size": 35914,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2t885o10jddmu.js",
+      "size": 198211,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/31aiofx2k_c41.js",
+      "size": 61259,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2mq47iusexbfq.js",
+      "size": 82013,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/2shcy7cccc7zo.js",
+      "size": 13796,
+      "rules": []
+    },
+    {
+      "name": "https://suno.com/_next/static/immutable/chunks/0r9vldcgrct2q.js",
+      "size": 663379,
+      "rules": []
+    }
+  ],
+  "failed": [],
+  "mode": "live",
+  "target": "https://suno.com/",
+  "generated_at": "2026-10-19T04:36:31.182Z",
+  "generator": "tools/scan-signer.js"
+}

@@ -1,0 +1,36 @@
+{
+  "name": "suno-beat-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Unofficial Suno.com API proxy for beat/music generation - pure HTTP (no Puppeteer/Playwright), Clerk auth keep-alive, low memory footprint (Render Free Tier friendly).",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test:signer": "node tools/test-signer.js",
+    "scan:signer": "node tools/scan-signer.js"
+  },
+  "keywords": [
+    "suno",
+    "suno-api",
+    "beat-generator",
+    "clerk",
+    "express",
+    "proxy"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ffmpeg-static": "^5.3.0"
+  },
+  "optionalDependencies": {
+    "ffmpeg-static": "^5.2.0"
+  }
+}

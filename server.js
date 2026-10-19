@@ -1,0 +1,3278 @@
+'use strict';
+
+/**
+ * ============================================================================
+ *  SUNO BEAT PROXY  v1.0.0
+ *  ---------------------------------------------------------------------------
+ *  Suno.com'un resmi olmayan (unofficial) Web API'sini, TAMAMEN HAFIF HTTP
+ *  istekleri ile kullanan bir proxy servisi.
+ *
+ *  TASARIM KARARLARI
+ *  -----------------
+ *  - Chromium / Puppeteer / Playwright YOKTUR. Sadece axios + express.
+ *    Bu sayede Render Free Tier (512 MB RAM / 0.1 CPU) uzerinde rahat calisir.
+ *    Tipik RSS: ~55-75 MB.
+ *  - Kimlik dogrulama, Suno'nun arkasindaki Clerk Auth sistemi taklit edilerek
+ *    yapilir:  __client cookie (refresh token)  ->  access JWT (Bearer).
+ *  - JWT'ler ~60 sn - 1 saat arasi yasar. Bu yuzden:
+ *        * setInterval ile her 15 dakikada bir "keep-alive" (session/touch),
+ *        * her istek oncesi "exp" kontrolu (lazy refresh) uygulanir.
+ *  - Token yenileme "single-flight" yapilir: 10 es zamanli istek gelse bile
+ *    Clerk'e yalnizca 1 yenileme cagrisi gider (rate-limit korumasi).
+ *
+ *  KAPSAM
+ *  -----
+ *  Suno'nun resmi bir urunu degildir; kendi hesabinizla calisir.
+ *  Uc nokta/alan adi degisiklikleri .env uzerinden karsilanir.
+ * ============================================================================
+ */
+
+require('dotenv').config();
+
+const express = require('express');
+const axios = require('axios');
+const { Transform } = require('stream');
+const crypto = require('crypto');
+const path = require('path');
+const providerRegistry = require('./providers');
+// Imza motoru + token cache havuzu (request 12)
+const signer = require('./utils/signer');
+const { SignerPool } = require('./utils/signerPool');
+
+// ============================================================================
+// 1. KONFIGURASYON
+// ============================================================================
+
+/** "true"/"1"/"yes" -> true  |  "false"/"0"/"" -> false  (env okuma yardimcisi) */
+function envBool(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+/** Sayisal env okuma yardimcisi (gecersiz deger -> fallback). */
+function envInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/** Sondaki "/" karakterlerini temizler. */
+function trimSlash(url) {
+  return String(url || '').replace(/\/+$/, '');
+}
+
+const CONFIG = {
+  // --- Sunucu ---
+  port: envInt(process.env.PORT, 3000),
+  apiKey: (process.env.API_KEY || '').trim(),
+  // --- Coklu API anahtari (x-api-key veya ?api_key=) ---
+  // ALLOWED_API_KEYS: virgulle ayrilmis liste. Bos ise dogrulama kapali kalir.
+  allowedApiKeys: (process.env.ALLOWED_API_KEYS || process.env.API_KEY || '')
+    .split(',')
+    .map((k) => k.trim())
+    .filter(Boolean),
+  // Anahtar listesi bossa bile 401 donmek icin true yapin (siki mod).
+  apiKeyRequired: envBool(process.env.API_KEY_REQUIRED, false),
+  // Public dashboard dizini
+  publicDir: path.join(__dirname, 'public'),
+
+  // --- Suno Studio API ---
+  // NOT: "studio-api.suno.ai" alan adi 2026 itibariyle 503 donduruyor.
+  // Guncel alan adi: studio-api.prod.suno.com
+  // Tarayici ag trafiginden dogrulanan host: studio-api-prod.suno.com
+  // (studio-api.prod.suno.com ayni backend'e gidiyor, ikisi de calisiyor)
+  sunoApiBase: trimSlash(process.env.SUNO_API_BASE || 'https://studio-api-prod.suno.com'),
+  generatePath: process.env.SUNO_GENERATE_PATH || '/api/generate/v2-web/',
+  feedPath: process.env.SUNO_FEED_PATH || '/api/feed/v2',
+
+  // --- Clerk Auth ---
+  clerkBaseUrl: trimSlash(process.env.CLERK_BASE_URL || 'https://clerk.suno.com'),
+  clerkJsVersion: process.env.CLERK_JS_VERSION || '5.35.0',
+
+  // --- Oturum ---
+  // __client cookie (Clerk refresh token) -> sinirsiz yenileme
+  refreshToken: (process.env.SUNO_REFRESH_TOKEN || '').trim(),
+  // Alternatif: tarayicidan alinmis hazir __session JWT'si (yenilenemez, ~1 saat).
+  // SUNO_REFRESH_TOKEN yoksa bununla calisir; /auth/token ile runtime'da degistirilebilir.
+  sessionToken: (process.env.SUNO_SESSION_TOKEN || '').trim(),
+  keepAliveIntervalMs: envInt(process.env.KEEPALIVE_INTERVAL_MS, 15 * 60 * 1000),
+  refreshBeforeExpiryMs: envInt(process.env.REFRESH_BEFORE_EXPIRY_MS, 5 * 60 * 1000),
+
+  // --- Uretim varsayilanlari ---
+  // Ucretsiz plan yalnizca chirp-v3-5'i kabul ediyor (digerleri 403 permission_denied).
+  defaultModel: process.env.DEFAULT_MODEL || 'chirp-v3-5',
+  // Model yetkisi yoksa sirayla denenecek modeller.
+  modelFallback: (process.env.MODEL_FALLBACK || 'chirp-v3-5,chirp-v4-5,chirp-v4').split(',').map((m) => m.trim()).filter(Boolean),
+  defaultInstrumental: envBool(process.env.DEFAULT_INSTRUMENTAL, true),
+
+  // --- Ag ---
+  requestTimeoutMs: envInt(process.env.REQUEST_TIMEOUT_MS, 30000),
+
+  // --- Anti-replay / cihaz kimligi ---
+  // Browser-Token her istekte uretilir (Suno'nun web bundle'indaki algoritma).
+  // Elle override gerekirse:
+  browserTokenOverride: (process.env.SUNO_BROWSER_TOKEN || '').trim(),
+  // suno_device_id cookie'si. Bos ise asagidaki sabitten otomatik uretilir.
+  deviceId: (process.env.SUNO_DEVICE_ID || '').trim(),
+  forwardClientCookie: envBool(process.env.FORWARD_CLIENT_COOKIE, true),
+
+  // --- Indirme proxy'si (SSRF korumasi) ---
+  // Yalnizca bu host'lardan akis yapilir. "*" KULLANMAYIN.
+  downloadAllowedHosts: (
+    process.env.DOWNLOAD_ALLOWED_HOSTS ||
+    'audiopipe.suno.ai,cdn1.suno.ai,cdn2.suno.ai,cdn.suno.ai,studio-api-prod.suno.com,studio-api.prod.suno.com'
+  )
+    .split(',')
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean),
+  // Guvenlik: .suno.ai ve alt alan adlarina da izin ver (ama sadece bu kok icin).
+  downloadAllowSunoSubdomains: envBool(process.env.DOWNLOAD_ALLOW_SUNO_SUBDOMAINS, true),
+  // Yalnizca yerel gelistirme icin: http:// ve IP literal'lerine izin verir.
+  // PRODUCTION'DA ASLA true YAPMAYIN.
+  downloadAllowHttp: envBool(process.env.DOWNLOAD_ALLOW_HTTP, false),
+
+  // --- TLS parmak izi (JA3/JA4) ayarlari ---
+  // true  -> upstream istekleri Chrome benzeri cipher/ALPN/ECDH ile yapilir.
+  // Not: Node, TLS uzanti SIRASINI ve GREASE degerlerini kontrol edemez; bu yuzden
+  // JA3/JA4 Chrome ile birebir eslesmez (bkz. README §15).
+  chromeTlsProfile: envBool(process.env.CHROME_TLS_PROFILE, true),
+
+  // --- Session handshake (akis oncesi yetkilendirme adimi) ---
+  // Akis isteginden once oturum kimligi alinir ve listen_milestone tetiklenir.
+  // Basarisiz olursa akis YINE devam eder (best-effort).
+  enableSessionHandshake: envBool(process.env.ENABLE_SESSION_HANDSHAKE, true),
+  handshakeTimeoutMs: envInt(process.env.HANDSHAKE_TIMEOUT_MS, 6000),
+  // Tetiklenecek milestone'lar
+  handshakeMilestones: (process.env.HANDSHAKE_MILESTONES || '5s,30s').split(',').map((m) => m.trim()).filter(Boolean),
+
+  // --- Upstream header/cookie gecisi (audiopipe + CDN) ---
+  // .env'e tarayicidan aldiginiz HAM Cookie header'ini yapistirin:
+  //   __client=...; __session=...; suno_device_id=...; __client_uat=...
+  // Bos ise yalnizca token'dan uretilen cookie'ler gonderilir.
+  cookieJar: (process.env.SUNO_COOKIE_JAR || '').trim(),
+  forwardCookies: envBool(process.env.FORWARD_UPSTREAM_COOKIES, true),
+  upstreamOrigin: process.env.UPSTREAM_ORIGIN || 'https://suno.com',
+  upstreamReferer: process.env.UPSTREAM_REFERER || 'https://suno.com/',
+  upstreamUserAgent: process.env.UPSTREAM_USER_AGENT || '',
+
+  // --- Saglayici secimi (AUDIO_PROVIDER=suno|replicate|elevenlabs|mock) ---
+  audioProvider: String(process.env.AUDIO_PROVIDER || 'suno').trim().toLowerCase(),
+
+  // --- Transparent proxy: ses kaynagi fallback'i ---
+  // audio_url "/api/forbidden" ise bu sablonla upstream'e gidilir.
+  // {id} klip id'siyle degistirilir. Sunucu baytlari DEGISTIRMEZ (pass-through).
+  audiopipeUrlTemplate:
+    process.env.AUDIOPIPE_URL_TEMPLATE ||
+    'https://audiopipe.suno.ai/?item_id={id}&format=mp3&encoded=true',
+
+  // --- Imza motoru (utils/signer.js + utils/signerPool.js) ---
+  // Bu katman YALNIZCA request parametresi uretir (sig/ts/expires...).
+  // Icerik cozme / DRM bu modulun kapsami DISINDADIR.
+  signerEnabled: envBool(process.env.SIGNER_ENABLED, true),
+  // Ornek spec:
+  //   sig=hmac_sha256_hex({id}|{ts},{secret});ts={ts};expires={ts_plus:300}
+  // Bos ise "derive" stratejisi kapalidir (varsayilan: bos).
+  signerSpec: (process.env.SIGNER_SPEC || '').trim(),
+  // Spec icindeki {secret} token'inin degeri. Loglanmaz.
+  signerSecret: (process.env.SIGNER_SECRET || '').trim(),
+  // Token cache havuzu
+  signerPoolEnabled: envBool(process.env.SIGNER_POOL_ENABLED, true),
+  signerPoolTtlMs: envInt(process.env.SIGNER_POOL_TTL_MS, 120000),
+  signerPoolMax: envInt(process.env.SIGNER_POOL_MAX, 500),
+  // Arka plan tazeleme periyodu (0 = kapali)
+  signerRefreshMs: envInt(process.env.SIGNER_REFRESH_MS, 30000),
+
+  // --- FFmpeg / transcode ---
+  // Bos ise `ffmpeg-static` paketi, o da yoksa PATH'teki `ffmpeg` kullanilir.
+  ffmpegPath: process.env.FFMPEG_PATH || '',
+  // Cikti bit hizi (mp3)
+  transcodeBitrate: process.env.TRANSCODE_BITRATE || '128k',
+  // Transcode'u tamamen kapatmak icin false
+  enableTranscode: envBool(process.env.ENABLE_TRANSCODE, true),
+
+  logLevel: (process.env.LOG_LEVEL || 'info').toLowerCase(),
+};
+
+// Taklit edilecek tarayici kimligi. Suno bot korumasi (Cloudflare) User-Agent
+// tutarliligi bekledigi icin tek bir sabit UA kullaniyoruz.
+const BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+// ============================================================================
+// 2. KUCUK YARDIMCILAR
+// ============================================================================
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Seviyeye gore log basar (LOG_LEVEL=debug|info|warn|error). */
+const LOG_LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
+function log(level, message, extra) {
+  const threshold = LOG_LEVELS[CONFIG.logLevel] ?? LOG_LEVELS.info;
+  if ((LOG_LEVELS[level] ?? 20) < threshold) return;
+  const line = `[${new Date().toISOString()}] [${level.toUpperCase()}] ${message}`;
+  if (extra !== undefined) {
+    // Token gibi hassas veriler loglanmasin diye sadece guvenli alanlar yazilir.
+    console.log(line, typeof extra === 'string' ? extra : JSON.stringify(extra));
+  } else {
+    console.log(line);
+  }
+}
+
+/**
+ * JWT payload'ini (base64url) cozer. Imza dogrulamasi YAPMAZ -
+ * bize yalnizca "exp" (son kullanma) bilgisi lazim.
+ */
+function decodeJwtPayload(token) {
+  try {
+    const part = String(token).split('.')[1];
+    if (!part) return null;
+    const json = Buffer.from(part.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    return JSON.parse(json);
+  } catch (_err) {
+    return null;
+  }
+}
+
+/** Token'in son kullanma zamani (ms). Okunamazsa 0 -> "suresi bilinmiyor". */
+function getTokenExpiryMs(token) {
+  const payload = decodeJwtPayload(token);
+  if (!payload || !payload.exp) return 0;
+  return payload.exp * 1000;
+}
+
+/**
+ * Suno'nun yayinladigi JWKS anahtarlari (imza dogrulamasi icin).
+ * 1 saat cache'lenir: her istekte Clerk'e gidip bellek/CPU harcamayiz.
+ */
+const jwksCache = { keys: null, fetchedAt: 0 };
+
+async function getJwks() {
+  const fresh = Date.now() - jwksCache.fetchedAt < 60 * 60 * 1000;
+  if (jwksCache.keys && fresh) return jwksCache.keys;
+  const { data } = await axios.get('https://auth.suno.com/.well-known/jwks.json', {
+    timeout: CONFIG.requestTimeoutMs,
+  });
+  jwksCache.keys = (data && data.keys) || [];
+  jwksCache.fetchedAt = Date.now();
+  return jwksCache.keys;
+}
+
+/**
+ * Bir JWT'nin imzasini Suno'nun anahtarlariyla dogrular.
+ * Amac: kopyalama sirasinda bozulmus / sahte token'lari ANINDA yakalamak.
+ * (Bozuk token'i Suno'ya gondermek bosuna 401 ve kredi/kota israfidir.)
+ *
+ * @returns {Promise<{signatureValid:boolean, expired:boolean, expiresInSeconds:number|null}>}
+ */
+async function verifyJwtSignature(token) {
+  const parts = String(token || '').trim().split('.');
+  if (parts.length !== 3) return { signatureValid: false, expired: true, expiresInSeconds: null };
+
+  const [h, p, s] = parts;
+  let header = {};
+  try {
+    header = JSON.parse(Buffer.from(h, 'base64url').toString('utf8'));
+  } catch (_e) {
+    return { signatureValid: false, expired: true, expiresInSeconds: null };
+  }
+
+  let keys = [];
+  try {
+    keys = await getJwks();
+  } catch (_e) {
+    // JWKS alinamazsa dogrulama yapamiyoruz; akisi engellemeyelim.
+    return { signatureValid: null, expired: false, expiresInSeconds: null };
+  }
+
+  const candidates = keys.filter((k) => !header.kid || k.kid === header.kid);
+  const usable = candidates.length ? candidates : keys;
+
+  let signatureValid = false;
+  for (const jwk of usable) {
+    try {
+      const key = require('crypto').createPublicKey({ key: jwk, format: 'jwk' });
+      if (require('crypto').verify('RSA-SHA256', Buffer.from(`${h}.${p}`), key, Buffer.from(s, 'base64url'))) {
+        signatureValid = true;
+        break;
+      }
+    } catch (_e) {
+      /* siradaki anahtar */
+    }
+  }
+
+  const expiresAt = getTokenExpiryMs(token);
+  return {
+    signatureValid,
+    expired: expiresAt !== 0 && expiresAt <= Date.now(),
+    expiresInSeconds: expiresAt ? Math.round((expiresAt - Date.now()) / 1000) : null,
+  };
+}
+
+/** Hata mesajindan token/cookie gibi hassas verileri temizler. */
+function sanitizeMessage(message) {
+  return String(message || '')
+    .replace(/eyJ[A-Za-z0-9._-]{10,}/g, '<token>')
+    .slice(0, 600);
+}
+
+/** HTTP durum kodu tasiyan hata (route katmani bunu dogru status'e cevirir). */
+class HttpError extends Error {
+  constructor(status, code, message, detail) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.detail = detail;
+  }
+}
+
+/**
+ * CHROME BENZERI TLS AGENT
+ * ------------------------
+ * Node'un varsayilan TLS parmak izi bazi WAF/CDN'lerde bot olarak isaretlenebiliyor.
+ * Bu agent Chrome'un cipher suite sirasini, TLS 1.2/1.3 araligini, ECDH egrisini
+ * ve ALPN'ini taklit eder.
+ *
+ * SINIRLAR (olculdu, bkz. README §15):
+ *  - Cipher listesi Chrome ile birebir ayni.
+ *  - TLS uzanti (extension) SIRASI Node/OpenSSL tarafindan belirlenir, degistirilemez.
+ *  - Chrome'un GREASE degerleri ve HTTP/2 SETTINGS cercevesi taklit edilemez.
+ *  => JA3 hash'i Chrome'unkiyle AYNI OLMAZ.
+ */
+const https = require('https');
+
+const CHROME_CIPHER_SUITES = [
+  'TLS_AES_128_GCM_SHA256',
+  'TLS_AES_256_GCM_SHA384',
+  'TLS_CHACHA20_POLY1305_SHA256',
+  'ECDHE-ECDSA-AES128-GCM-SHA256',
+  'ECDHE-RSA-AES128-GCM-SHA256',
+  'ECDHE-ECDSA-AES256-GCM-SHA384',
+  'ECDHE-RSA-AES256-GCM-SHA384',
+  'ECDHE-ECDSA-CHACHA20-POLY1305',
+  'ECDHE-RSA-CHACHA20-POLY1305',
+  'ECDHE-RSA-AES128-SHA',
+  'ECDHE-RSA-AES256-SHA',
+  'AES128-GCM-SHA256',
+  'AES256-GCM-SHA384',
+  'AES128-SHA',
+  'AES256-SHA',
+].join(':');
+
+let _chromeAgent = null;
+
+/** Upstream isteklerinde kullanilacak https.Agent (tekil, keep-alive). */
+function getUpstreamAgent() {
+  if (!CONFIG.chromeTlsProfile) return undefined;
+  if (_chromeAgent) return _chromeAgent;
+
+  try {
+    _chromeAgent = new https.Agent({
+      keepAlive: true,
+      keepAliveMsecs: 30000,
+      maxSockets: 32,
+      maxFreeSockets: 8,
+      minVersion: 'TLSv1.2',
+      maxVersion: 'TLSv1.3',
+      ciphers: CHROME_CIPHER_SUITES,
+      ecdhCurve: 'X25519:P-256:P-384',
+      // axios http/1.1 konusuyor: ALPN'de yalnizca http/1.1 bildirilmelidir.
+      ALPNProtocols: ['http/1.1'],
+      honorCipherOrder: true,
+      secureOptions:
+        crypto.constants.SSL_OP_NO_RENEGOTIATION | crypto.constants.SSL_OP_NO_COMPRESSION,
+    });
+    log('info', 'Chrome benzeri TLS agent aktif.', {
+      ciphers: CHROME_CIPHER_SUITES.split(':').length,
+      ecdhCurve: 'X25519:P-256:P-384',
+      alpn: 'http/1.1',
+    });
+    return _chromeAgent;
+  } catch (err) {
+    log('warn', 'TLS agent olusturulamadi, varsayilan kullanilacak.', err.message);
+    return undefined;
+  }
+}
+
+/**
+ * FFmpeg ikilisi: 1) FFMPEG_PATH  2) ffmpeg-static paketi  3) PATH'teki "ffmpeg"
+ * Bulunamazsa transcode devre disi kalir (passthrough'a duser), servis calismaya devam eder.
+ */
+let _ffmpegResolved;
+function resolveFfmpeg() {
+  if (_ffmpegResolved !== undefined) return _ffmpegResolved;
+
+  if (CONFIG.ffmpegPath) {
+    _ffmpegResolved = CONFIG.ffmpegPath;
+    return _ffmpegResolved;
+  }
+  try {
+    // eslint-disable-next-line global-require, import/no-unresolved
+    const staticPath = require('ffmpeg-static');
+    if (staticPath) {
+      _ffmpegResolved = staticPath;
+      log('info', 'FFmpeg bulundu (ffmpeg-static).', { path: staticPath });
+      return _ffmpegResolved;
+    }
+  } catch (_e) {
+    /* paket kurulu degil - sorun degil */
+  }
+  _ffmpegResolved = 'ffmpeg'; // PATH'te ara
+  log('warn', 'ffmpeg-static yok, PATH\'teki "ffmpeg" denenecek.');
+  return _ffmpegResolved;
+}
+
+/** ffmpeg-spesifik argümanlar (pipe:0 -> mp3 -> pipe:1). */
+function buildFfmpegArgs({ bitrate, format }) {
+  const base = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-i', 'pipe:0', '-vn'];
+
+  if (format === 'mp3') {
+    return [...base, '-map_metadata', '-1', '-acodec', 'libmp3lame', '-b:a', bitrate, '-f', 'mp3', 'pipe:1'];
+  }
+  if (format === 'wav') {
+    return [...base, '-acodec', 'pcm_s16le', '-f', 'wav', 'pipe:1'];
+  }
+  // Varsayilan: mp3
+  return [...base, '-map_metadata', '-1', '-acodec', 'libmp3lame', '-b:a', bitrate, '-f', 'mp3', 'pipe:1'];
+}
+
+/**
+ * ByteRangeTransform
+ * ------------------
+ * Bazi upstream'ler (orn. audiopipe) HTTP Range'i YOK SAYAR ve her zaman 200 +
+ * tam govde doner. Tarayici ise <audio> ile seek ederken Range ister.
+ *
+ * Bu Transform, tam govdeyi indirirken istemcinin istedigi bayt araligini
+ * ayiklar; aradaki baytlar okunur ama AKTARILMAZ (push edilmez). Bellekte
+ * birikme olmaz: sadece sayac tutulur (`skip`/`end`), chunk'lar dilimlenir.
+ *
+ *   bytes=1000-1999  ->  offset 1000, 1000 bayt aktarilir
+ *   bytes=5000-      ->  offset 5000, sona kadar
+ *
+ * `this.push()` yalnizca istenen aralikta cagrilir; backpressure korunur.
+ */
+class ByteRangeTransform extends Transform {
+  /**
+   * @param {{start:number, end:number|null, total:number|null}} range
+   */
+  constructor(range) {
+    super();
+    this.start = range.start;
+    this.end = range.end; // null => sona kadar
+    this.offset = 0;      // upstream'den okunan toplam bayt
+    this.sent = 0;        // istemciye gonderilen bayt
+    this.finished = false;
+  }
+
+  _transform(chunk, _encoding, callback) {
+    if (this.finished) {
+      // Aralik tamamlandi: kalan veriyi tuket ama gonderme (backpressure icin
+      // upstream'in bitmesini beklemek yerine akisi sonlandiriyoruz).
+      this.finished = true;
+      return callback();
+    }
+
+    const chunkStart = this.offset;
+    const chunkEnd = this.offset + chunk.length - 1; // dahil
+    this.offset += chunk.length;
+
+    // Istegin baslangicindan onceki chunk -> tamamen atla
+    if (chunkEnd < this.start) return callback();
+
+    const localStart = Math.max(0, this.start - chunkStart);
+    const localEnd = this.end === null ? chunk.length - 1 : Math.min(chunk.length - 1, this.end - chunkStart);
+
+    if (localEnd < localStart) return callback();
+
+    const slice = chunk.subarray(localStart, localEnd + 1);
+    this.sent += slice.length;
+    this.push(slice);
+
+    // Istenen aralik tamamlandi mi?
+    if (this.end !== null && chunkStart + localEnd >= this.end) {
+      this.finished = true;
+      this.emit('range:done'); // route katmani akisi kapatabilsin
+    }
+    return callback();
+  }
+}
+
+/**
+ * Ilk chunk'i, header gondermeden once "dikizler".
+ * Boylece 0 bayt donen upstream'ler icin istemciye duzgun bir JSON hata
+ * dondurebiliyoruz (aksi halde basliklar coktan gitmis oluyor).
+ *
+ * @returns {Promise<Buffer|null|undefined>} chunk | null (bos akis) | undefined (zaman asimi)
+ */
+function peekFirstChunk(stream, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const detach = () => {
+      clearTimeout(timer);
+      stream.removeListener('data', onData);
+      stream.removeListener('end', onEnd);
+      stream.removeListener('error', onError);
+    };
+
+    const onData = (chunk) => {
+      if (settled) return;
+      settled = true;
+      detach();
+      stream.pause();
+      // Tuketilen chunk'i geri koy -> pipe() tekrar okuyacak
+      if (chunk && chunk.length) stream.unshift(chunk);
+      resolve(chunk && chunk.length ? chunk : null);
+    };
+
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      detach();
+      resolve(null);
+    };
+
+    const onError = (e) => {
+      if (settled) return;
+      settled = true;
+      detach();
+      log('warn', 'Upstream dikiz hatasi.', sanitizeMessage(e.message));
+      resolve(undefined);
+    };
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      detach();
+      resolve(undefined);
+    }, timeoutMs);
+
+    stream.once('data', onData);
+    stream.once('end', onEnd);
+    stream.once('error', onError);
+  });
+}
+
+/**
+ * ByteCounterTransform
+ * --------------------
+ * Akisi degistirmeden gecirir, yalnizca bayt sayar. Bos (0 bayt) upstream
+ * yanitlarini tespit etmek ve loglamak icin kullanilir.
+ * Backpressure'i bozmaz: data event'i dinlenmez, pipe zincirinde kalir.
+ */
+class ByteCounterTransform extends Transform {
+  constructor() {
+    super();
+    this.bytes = 0;
+    this.firstChunk = null;
+  }
+
+  _transform(chunk, _encoding, callback) {
+    if (this.bytes === 0 && chunk.length) {
+      this.firstChunk = Buffer.from(chunk.subarray(0, 16));
+    }
+    this.bytes += chunk.length;
+    this.push(chunk);
+    callback();
+  }
+}
+
+/** Content-Range / Range basligi ayristiricisi. "bytes=0-1023" -> {start:0,end:1023} */
+function parseRangeHeader(header, totalSize) {
+  if (!header || typeof header !== 'string') return null;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!m) return null;
+
+  const [, rawStart, rawEnd] = m;
+  if (rawStart === '' && rawEnd === '') return null;
+
+  let start;
+  let end;
+  if (rawStart === '') {
+    // "bytes=-500" -> son 500 bayt
+    const suffix = Number.parseInt(rawEnd, 10);
+    if (!Number.isFinite(suffix) || suffix <= 0) return null;
+    if (!Number.isFinite(totalSize)) return null; // toplam boyut bilinmeden hesaplanamaz
+    start = Math.max(0, totalSize - suffix);
+    end = totalSize - 1;
+  } else {
+    start = Number.parseInt(rawStart, 10);
+    end = rawEnd === '' ? null : Number.parseInt(rawEnd, 10);
+  }
+
+  if (!Number.isFinite(start) || start < 0) return null;
+  if (end !== null && (!Number.isFinite(end) || end < start)) return null;
+  if (Number.isFinite(totalSize) && start >= totalSize) return { unsatisfiable: true, totalSize };
+
+  return { start, end };
+}
+
+/**
+ * Tum kaynaklari (upstream stream + ffmpeg subprocess) guvenli sekilde kapatir.
+ * Idempotent: birden fazla kez cagrilabilir (close + error ayni anda gelebilir).
+ */
+function makeCleanup(upstreamStream, proc) {
+  let done = false;
+  return function cleanup() {
+    if (done) return;
+    done = true;
+
+    try {
+      if (upstreamStream && !upstreamStream.destroyed) upstreamStream.destroy();
+    } catch (_e) {}
+
+    if (proc && proc.exitCode === null && !proc.killed) {
+      try {
+        proc.stdin && proc.stdin.destroy();
+      } catch (_e) {}
+      try {
+        proc.kill('SIGTERM');
+      } catch (_e) {}
+      // Inatciysa 2 sn sonra zorla oldur (zombie/leak olmasin)
+      setTimeout(() => {
+        try {
+          if (proc.exitCode === null) proc.kill('SIGKILL');
+        } catch (_e) {}
+      }, 2000).unref();
+    }
+  };
+}
+
+/**
+ * Ortak ses akis boru hatti.
+ *
+ *   upstream (axios stream)  ->  [ ffmpeg (opsiyonel) ]  ->  res
+ *
+ * Garantiler:
+ *  - Dosya bellekte buffer'lanmaz; her sey pipe ile akar (512 MB limiti icin sart).
+ *  - Istemci koparsa (res 'close') upstream + ffmpeg kapatilir.
+ *  - ffmpeg hata verirse anlamli 502 + stderr ozeti doner.
+ *  - ffmpeg yoksa sessizce passthrough yapilir (X-Transcode: none).
+ *
+ * @returns {Promise<void>}
+ */
+/** Akis/probe icin upstream header set'i (tek kaynak: tutarlilik). */
+function buildStreamUpstreamHeaders(req, sessionId) {
+  const cookieHeader = buildUpstreamCookieHeader(authState.accessToken || CONFIG.sessionToken || null);
+
+  const headers = {
+    'User-Agent': CONFIG.upstreamUserAgent || BROWSER_UA,
+    Accept: '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    Referer: CONFIG.upstreamReferer,
+    Origin: CONFIG.upstreamOrigin,
+    'Browser-Token': buildBrowserToken(),
+    'Device-Id': resolveDeviceId(),
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-site',
+  };
+  if (cookieHeader) headers.Cookie = cookieHeader;
+  if (req && req.headers && req.headers.range) headers.Range = req.headers.range;
+  // Handshake'ten gelen oturum kimligi (upstream bunu bekliyorsa)
+  if (sessionId) headers['X-Session-Id'] = sessionId;
+  return headers;
+}
+
+async function pipeAudioStream(req, res, opts) {
+  const {
+    upstreamUrl,
+    transcode = false,
+    format = 'mp3',
+    filename = 'suno-audio.mp3',
+    inline = false,
+    proxyMode = 'cdn',
+    sessionId = null,
+  } = opts;
+
+  // Transparent mod: sunucu baytlari DEGISTIRMEZ, yalnizca aktarir.
+  const isTransparent = proxyMode === 'transparent';
+
+  // --- 1) Upstream header'larini hazirla (cookie + tarayici basliklari) ---
+  const cookieHeader = buildUpstreamCookieHeader(authState.accessToken || CONFIG.sessionToken || null);
+  const upstreamHeaders = buildStreamUpstreamHeaders(req, sessionId);
+
+  log('debug', 'Upstream istek basliklari.', {
+    url: String(upstreamUrl).slice(0, 120),
+    range: upstreamHeaders.Range || null,
+    hasCookie: Boolean(cookieHeader),
+    cookieNames: cookieHeader ? cookieHeader.split(';').map((c) => c.split('=')[0].trim()) : [],
+  });
+
+  // --- 2) Upstream'i ac ---
+  const upstream = await axios({
+    method: 'get',
+    url: upstreamUrl,
+    responseType: 'stream',
+    timeout: CONFIG.requestTimeoutMs,
+    maxRedirects: 3,
+    decompress: false,
+    validateStatus: () => true,
+    headers: upstreamHeaders,
+    httpsAgent: getUpstreamAgent(),
+    proxy: false,
+  });
+
+  // --- Bos (0 bayt) yanit tespiti ---
+  // Suno'nun audiopipe servisi bazi durumlarda 200 + Content-Length:0 donduruyor.
+  // Istemciye bos bir "ses" gondermek yerine teshis bilgisi veriyoruz.
+  const declaredLength = upstream.headers['content-length'];
+  if (String(declaredLength) === '0') {
+    upstream.data.destroy();
+    const err = new HttpError(
+      502,
+      'UPSTREAM_EMPTY',
+      'Upstream 200 dondurdu ancak govde 0 bayt (Content-Length: 0).',
+      `upstream_status=${upstream.status} upstream_length=0 ` +
+        `content_type=${upstream.headers['content-type'] || '-'} ` +
+        `headers_forwarded=cookie:${Boolean(buildUpstreamCookieHeader(authState.accessToken || CONFIG.sessionToken))} ` +
+        `origin/referer/ua/browser-token/device-id:evet`,
+    );
+    err.upstreamStatus = upstream.status;
+    throw err;
+  }
+
+  if (upstream.status !== 200 && upstream.status !== 206) {
+    upstream.data.destroy();
+    const err = new HttpError(
+      502,
+      'UPSTREAM_ERROR',
+      `Ses kaynagindan alinamadi (HTTP ${upstream.status}).`,
+      upstream.status === 403
+        ? 'CDN 403: bu dosya icin yetki yok veya imzali URL suresi dolmus.'
+        : undefined,
+    );
+    throw err;
+  }
+
+  const upstreamType = String(upstream.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  const looksAudio = upstreamType.startsWith('audio/') || upstreamType === 'application/octet-stream';
+
+  let proc = null;
+  let willTranscode = false;
+
+  if (transcode && CONFIG.enableTranscode) {
+    if (!looksAudio) {
+      // Ses olmayan bir govdeyi ffmpeg'e vermek anlamsiz (JSON hata vb.)
+      log('warn', 'Upstream ses degil, transcode atlandi.', { upstreamType });
+    } else {
+      willTranscode = true;
+    }
+  }
+
+  const safeName = String(filename).replace(/["\r\n\\/]/g, '_').slice(0, 120);
+
+  // --- 3) Transcode yolu ---
+  if (willTranscode) {
+    const ffmpegPath = resolveFfmpeg();
+    const args = buildFfmpegArgs({ bitrate: CONFIG.transcodeBitrate, format });
+    const { spawn } = require('child_process');
+
+    proc = spawn(ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+
+    const cleanup = makeCleanup(upstream.data, proc);
+
+    // ffmpeg stderr'ini topla (hata teshisi icin, max 2 KB)
+    let stderrTail = '';
+    proc.stderr.on('data', (chunk) => {
+      stderrTail = (stderrTail + chunk.toString()).slice(-2048);
+    });
+
+    let ffmpegFailed = false;
+    proc.on('error', (spawnErr) => {
+      ffmpegFailed = true;
+      log('error', 'FFmpeg baslatilamadi.', spawnErr.message);
+      cleanup();
+      if (!res.headersSent) {
+        sendError(res, 502, 'TRANSCODER_UNAVAILABLE', 'FFmpeg baslatilamadi (kurulu mu?).', spawnErr.message);
+      } else {
+        res.destroy();
+      }
+    });
+
+    // Basliklari ffmpeg ilk veriyi uretmeden once gonderiyoruz (chunked).
+    res.status(200);
+    res.setHeader('Content-Type', format === 'wav' ? 'audio/wav' : 'audio/mpeg');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.setHeader('Access-Control-Allow-Origin', req.get('origin') || '*');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Type, Content-Disposition, X-Transcode');
+    res.setHeader('X-Transcode', `ffmpeg:${format}`);
+    res.setHeader('X-Proxy-Mode', proxyMode);
+    res.setHeader('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename="${safeName}"`);
+
+    // Upstream -> ffmpeg.stdin (backpressure pipe ile otomatik)
+    upstream.data.on('error', (e) => {
+      log('warn', 'Upstream akis hatasi (transcode).', sanitizeMessage(e.message));
+      cleanup();
+      if (!res.headersSent) sendError(res, 502, 'STREAM_ERROR', 'Kaynak akis hatasi.');
+      else res.destroy();
+    });
+
+    upstream.data.pipe(proc.stdin);
+    proc.stdin.on('error', () => {
+      /* upstream kapandi - yut */
+    });
+
+    // ffmpeg.stdout -> res
+    proc.stdout.pipe(res);
+
+    proc.stdout.on('error', () => cleanup());
+
+    // ffmpeg normal/hatali cikis
+    proc.on('close', (code, signal) => {
+      if (code !== 0 && code !== null && !ffmpegFailed && !res.writableEnded) {
+        log('warn', 'FFmpeg hata ile kapandi.', { code, signal, stderr: stderrTail.slice(-400) });
+        if (!res.headersSent) {
+          sendError(res, 502, 'TRANSCODE_FAILED', 'FFmpeg donusturme basarisiz.', stderrTail.slice(-400));
+        } else {
+          res.destroy();
+        }
+      }
+      cleanup();
+    });
+
+    // Istemci koptu -> her seyi kapat
+    res.on('close', cleanup);
+    return;
+  }
+
+  // --- 4) Passthrough yolu (transcode yok / kaynak zaten ses) ---
+  const contentType = upstream.headers['content-type'] || 'application/octet-stream';
+  const rawLength = upstream.headers['content-length'];
+  const totalSize = rawLength !== undefined ? Number.parseInt(rawLength, 10) : NaN;
+
+  const cleanup = makeCleanup(upstream.data, null);
+  upstream.data.on('error', (e) => {
+    log('warn', 'Upstream akis hatasi (passthrough).', sanitizeMessage(e.message));
+    cleanup();
+    if (!res.headersSent) sendError(res, 502, 'STREAM_ERROR', 'Kaynak akis hatasi.');
+    else res.destroy();
+  });
+  res.on('close', cleanup);
+
+  // --- Range destegi ---
+  // 1) Upstream kendisi 206 dondüyse (Range'i destekliyor): dogrudan aktar.
+  const upstreamHonoredRange = upstream.status === 206;
+  const clientRange = parseRangeHeader(req.headers.range, Number.isFinite(totalSize) ? totalSize : null);
+
+  const baseHeaders = {
+    'Content-Type': contentType,
+    'Cache-Control': 'public, max-age=3600',
+    'Access-Control-Allow-Origin': req.get('origin') || '*',
+    'Access-Control-Expose-Headers':
+      'Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition, X-Transcode, X-Proxy-Mode',
+    'Accept-Ranges': 'bytes',
+    'X-Transcode': 'none',
+    'X-Proxy-Mode': proxyMode,
+    'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename="${safeName}"`,
+  };
+  for (const [k, v] of Object.entries(baseHeaders)) res.setHeader(k, v);
+
+  if (upstreamHonoredRange) {
+    // Upstream Range'i uyguladi -> basliklarini aynen gecir
+    if (upstream.headers['content-range']) res.setHeader('Content-Range', upstream.headers['content-range']);
+    if (rawLength) res.setHeader('Content-Length', rawLength);
+    res.status(206);
+    upstream.data.pipe(res);
+    return;
+  }
+
+  if (clientRange && !clientRange.unsatisfiable && Number.isFinite(totalSize)) {
+    // 2) Istemci Range istedi, upstream YOK SAYDI -> byte slicing ile biz uygulariz.
+    const end = clientRange.end === null ? totalSize - 1 : Math.min(clientRange.end, totalSize - 1);
+    const length = end - clientRange.start + 1;
+
+    res.status(206);
+    res.setHeader('Content-Range', `bytes ${clientRange.start}-${end}/${totalSize}`);
+    res.setHeader('Content-Length', String(length));
+
+    const slicer = new ByteRangeTransform({ start: clientRange.start, end, total: totalSize });
+    slicer.on('error', (e) => {
+      log('warn', 'Range transform hatasi.', sanitizeMessage(e.message));
+      cleanup();
+      res.destroy();
+    });
+    slicer.on('range:done', () => {
+      // Istenen aralik tamamlandi: upstream'i kapat, yaniti bitir.
+      cleanup();
+      if (!res.writableEnded) res.end();
+    });
+    res.on('close', () => {
+      cleanup();
+      slicer.destroy();
+    });
+
+    upstream.data.pipe(slicer).pipe(res);
+    return;
+  }
+
+  if (clientRange && clientRange.unsatisfiable) {
+    cleanup();
+    res.setHeader('Content-Range', `bytes */${totalSize}`);
+    return sendError(res, 416, 'RANGE_NOT_SATISFIABLE', 'Istenen bayt araligi dosya boyutunu asiyor.');
+  }
+
+  // 3) Range yok -> tam govde
+  //    Header gondermeden once ilk chunk'i dikizle: bos yaniti temiz raporlayalim.
+  const peeked = await peekFirstChunk(upstream.data, 8000);
+
+  if (peeked === null) {
+    cleanup();
+    res.setHeader('X-Upstream-Status', `${upstream.status}-empty`);
+    return sendError(
+      res,
+      502,
+      'UPSTREAM_EMPTY',
+      'Upstream baglandi (200) fakat hic bayt gondermedi.',
+      `upstream_status=${upstream.status} content_type=${upstream.headers['content-type'] || '-'} ` +
+        `content_length=${declaredLength ?? 'yok'} ` +
+        `headers_forwarded=[UA, Accept-Language, Origin, Referer, Browser-Token, Device-Id, Cookie] ` +
+        `range_forwarded=${Boolean(req.headers.range)} — ` +
+        `upstream 200 + bos govde dondurdu; bu istemci header'larindan bagimsiz olabilir ` +
+        `(bkz. GET /debug/stream/${req.params.id || '<id>'} A/B testi)`,
+    );
+  }
+
+  if (peeked === undefined) {
+    cleanup();
+    res.setHeader('X-Upstream-Status', `${upstream.status}-stalled`);
+    return sendError(
+      res,
+      504,
+      'UPSTREAM_STALLED',
+      'Upstream baglandi fakat 8 saniye icinde veri gondermedi.',
+      `upstream_status=${upstream.status} content_type=${upstream.headers['content-type'] || '-'}`,
+    );
+  }
+
+  if (rawLength) res.setHeader('Content-Length', rawLength);
+  res.status(200);
+
+  const counter = new ByteCounterTransform();
+
+  counter.on('error', (e) => {
+    log('warn', 'Sayac transform hatasi.', sanitizeMessage(e.message));
+    cleanup();
+    res.destroy();
+  });
+
+  counter.on('end', () => {
+    if (counter.bytes === 0) {
+      log('warn', 'Upstream 0 bayt aktardi.', { proxyMode });
+      if (!res.headersSent) {
+        res.setHeader('X-Upstream-Status', '200-empty');
+        sendError(res, 502, 'UPSTREAM_EMPTY', 'Upstream bos govde dondurdu.');
+      } else {
+        res.destroy();
+      }
+    } else {
+      log('debug', 'Akis tamamlandi.', {
+        bytes: counter.bytes,
+        firstBytes: counter.firstChunk ? counter.firstChunk.toString('hex') : null,
+      });
+    }
+  });
+
+  res.on('close', () => {
+    cleanup();
+    counter.destroy();
+  });
+
+  upstream.data.pipe(counter).pipe(res);
+}
+
+/**
+ * URL dogrulama (SSRF onlemi).
+ *
+ * /download?url=... istemci kontrollu bir adresi sunucu adina cagirir; bu yuzden
+ * adres su kurallardan gecer:
+ *   1. Sema: https (DOWNLOAD_ALLOW_HTTP=true ise http de kabul)
+ *   2. Host allowlist (DOWNLOAD_ALLOWED_HOSTS) veya *.suno.ai
+ *   3. IP literal / localhost / .local / .internal reddedilir
+ *   4. Redirect hedefi de ayni kontrolden gecer
+ */
+function isAllowedDownloadUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl));
+  } catch (_e) {
+    return { ok: false, reason: 'URL cozumlenemedi' };
+  }
+
+  if (parsed.protocol !== 'https:' && !(CONFIG.downloadAllowHttp && parsed.protocol === 'http:')) {
+    return { ok: false, reason: 'Yalnizca https:// adreslerine izin verilir' };
+  }
+
+  const host = parsed.hostname.toLowerCase();
+
+  // IP literal, localhost ve ic ag isimleri
+  if (
+    (!CONFIG.downloadAllowHttp && /^\d{1,3}(\.\d{1,3}){3}$/.test(host)) ||
+    host === 'localhost' ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    host.includes(':')
+  ) {
+    return { ok: false, reason: 'IP / ic ag adreslerine izin verilmez' };
+  }
+
+  const listed = CONFIG.downloadAllowedHosts.includes(host);
+  const sunoSub =
+    CONFIG.downloadAllowSunoSubdomains && (host === 'suno.ai' || host.endsWith('.suno.ai'));
+
+  if (!listed && !sunoSub) {
+    return { ok: false, reason: `Host izinli degil: ${host}` };
+  }
+  return { ok: true, url: parsed.toString() };
+}
+
+/**
+ * Istemciden gelen imzali parametreler.
+ * audiopipe bazi durumlarda zaman damgali/imzali query parametreleri bekliyor;
+ * bunlari istemci uretir, proxy yalnizca iletir.
+ */
+const SIGNED_PARAM_KEYS = [
+  'sig',
+  'signature',
+  'expires',
+  'exp',
+  'expiry',
+  'token',
+  't',
+  'ts',
+  'key',
+  'hmac',
+  'nonce',
+  'policy',
+  'kid',
+  'session_id',
+  'sessionId',
+  'stream_id',
+];
+
+/**
+ * Sablondaki {id} ve {param} yer tutucularini doldurur.
+ *   https://audiopipe.suno.ai/?item_id={id}&sig={sig}&expires={expires}
+ * Istekte olmayan yer tutucular bos string'e cevrilir.
+ */
+function fillUrlTemplate(template, clipId, req) {
+  let out = String(template).replace(/\{id\}/g, encodeURIComponent(clipId));
+  out = out.replace(/\{([a-zA-Z0-9_]+)\}/g, (_m, name) => {
+    const value = req && req.query ? req.query[name] : undefined;
+    return value === undefined || value === null ? '' : encodeURIComponent(String(value));
+  });
+  return out;
+}
+
+/**
+ * Istekteki imzali parametreleri URL'e ekler (varsa).
+ */
+function appendSignedParams(urlString, req) {
+  if (!req || !req.query) return urlString;
+  try {
+    const u = new URL(urlString);
+    for (const key of SIGNED_PARAM_KEYS) {
+      const value = req.query[key];
+      if (value !== undefined && value !== null && value !== '') {
+        u.searchParams.set(key, String(value));
+      }
+    }
+    return u.toString();
+  } catch (_e) {
+    return urlString;
+  }
+}
+
+/**
+ * Klibin ses kaynagini cozer.
+ *  1. audio_url gercek bir CDN linkiyse onu kullanir (Pro plan).
+ *  2. "/api/forbidden" ise audiopipe sablonuna duser (pass-through).
+ *
+ * Not: bu fonksiyon yalnizca URL uretir; bayt donusumu YAPMAZ.
+ */
+/**
+ * SESSION HANDSHAKE
+ * -----------------
+ * Akis isteginden once calisan iki adim:
+ *
+ *   1) GET  /api/user/get_user_session_id/            -> { session_id }
+ *   2) POST /api/gen/{id}/listen_milestone            -> { milestone: "5s"|"30s"|"60s" }
+ *
+ * Ikisi de basarisiz olsa bile akis devam eder; sonuc X-Handshake basligiyla
+ * raporlanir:  ok | partial | failed | disabled
+ */
+const handshakeState = {
+  lastSessionId: null,
+  lastSessionAt: 0,
+  lastResult: null,
+  lastError: null,
+  runs: 0,
+};
+
+/** Session id'yi getirir (30 dk cache; hata durumunda null). */
+async function getAnalyticsSessionId(force = false) {
+  const fresh = Date.now() - handshakeState.lastSessionAt < 30 * 60 * 1000;
+  if (!force && handshakeState.lastSessionId && fresh) return handshakeState.lastSessionId;
+
+  try {
+    const data = await sunoRequest('get', '/api/user/get_user_session_id/');
+    if (!data || !data.session_id) throw new Error('session_id alani yok');
+    handshakeState.lastSessionId = data.session_id;
+    handshakeState.lastSessionAt = Date.now();
+    log('debug', 'Session id alindi.', { sessionId: String(data.session_id).slice(0, 16) });
+    return data.session_id;
+  } catch (err) {
+    log('warn', 'Session id alinamadi.', sanitizeMessage(err.message));
+    return null;
+  }
+}
+
+/** listen_milestone tetikler (telemetri/akis yetkisi adimi). */
+async function fireListenMilestone(clipId, milestone) {
+  try {
+    await sunoRequest('post', `/api/gen/${encodeURIComponent(clipId)}/listen_milestone`, {
+      milestone,
+    });
+    log('debug', 'listen_milestone tetiklendi.', { clipId, milestone });
+    return true;
+  } catch (err) {
+    log('warn', 'listen_milestone basarisiz.', { milestone, error: sanitizeMessage(err.message) });
+    return false;
+  }
+}
+
+/**
+ * Akis oncesi handshake. ASLA throw etmez.
+ * @returns {Promise<{result:string, sessionId:string|null, milestones:number}>}
+ */
+async function runStreamHandshake(clipId) {
+  if (!CONFIG.enableSessionHandshake) {
+    return { result: 'disabled', sessionId: null, milestones: 0 };
+  }
+
+  handshakeState.runs += 1;
+  const sessionId = await getAnalyticsSessionId();
+
+  let fired = 0;
+  for (const m of CONFIG.handshakeMilestones) {
+    // eslint-disable-next-line no-await-in-loop
+    if (await fireListenMilestone(clipId, m)) fired += 1;
+  }
+
+  const result = sessionId && fired > 0 ? 'ok' : sessionId || fired > 0 ? 'partial' : 'failed';
+  handshakeState.lastResult = result;
+  handshakeState.lastError = result === 'failed' ? 'session_id ve milestone basarisiz' : null;
+  log('info', 'Stream handshake.', { clipId, result, milestones: fired });
+  return { result, sessionId, milestones: fired };
+}
+
+/**
+ * Upstream'e gonderilecek Cookie header'ini olusturur.
+ * Oncelik: SUNO_COOKIE_JAR (ham) > token'dan uretilen cookie'ler.
+ */
+function buildUpstreamCookieHeader(token) {
+  if (!CONFIG.forwardCookies) return null;
+
+  if (CONFIG.cookieJar) {
+    return CONFIG.cookieJar.replace(/^\s*cookie:\s*/i, '').trim();
+  }
+
+  const parts = [];
+  const refresh = CONFIG.refreshToken;
+  if (refresh) {
+    if (refresh.includes('__client=')) {
+      const m = refresh.match(/__client=([^;]+)/);
+      parts.push(m ? `__client=${m[1].trim()}` : `__client=${refresh.trim()}`);
+    } else {
+      parts.push(`__client=${refresh.trim()}`);
+    }
+  }
+  if (token) parts.push(`__session=${token}`);
+  const devId = resolveDeviceId();
+  if (devId) parts.push(`suno_device_id=${devId}`);
+
+  return parts.length ? parts.join('; ') : null;
+}
+
+
+// ============================================================================
+// 2b. IMZA MOTORU  (utils/signer.js + utils/signerPool.js)
+// ============================================================================
+//
+//  AKIS
+//  ----
+//    resolveAudioSource()
+//      -> resolveSignature()      [strateji secimi]
+//          1. client : istemci sig/expires gonderdi (?sig=... | X-Sign-Params)
+//          2. pool   : token cache havuzunda taze kayit var
+//          3. derive : SIGNER_SPEC ile matematiksel turetim (varsayilan kapali)
+//          4. none   : parametresiz sablon URL
+//      -> signer.buildSignedUrl() [parametreleri URL'e ekler]
+//
+//  KAPSAM SINIRI (degismedi)
+//  -------------------------
+//  Bu katman yalnizca HTTP istek parametresi uretir. Icerik sifreleme/cozme,
+//  DRM lisansi, AES anahtari BU MODULDE YOKTUR; akis baytlari DEGISTIRILMEZ.
+// ============================================================================
+
+/** Imza parametresi havuzu (TTL'li, LRU, single-flight). */
+const signaturePool = new SignerPool({
+  ttlMs: CONFIG.signerPoolTtlMs,
+  max: CONFIG.signerPoolMax,
+  refreshMs: CONFIG.signerRefreshMs,
+});
+
+/**
+ * Havuzun arka plan tazeleyicisi.
+ * Cerezler .env / istek baglamindan okunur, DISKTE VEYA LOGDA TUTULMAZ.
+ * Spec bos ise tazeleme yapilmaz (null doner).
+ */
+signaturePool.setRefresher(async (clipId) => {
+  if (!CONFIG.signerSpec) return null;
+  const derived = signer.deriveParams(CONFIG.signerSpec, buildSignerContext(clipId, null));
+  return derived.params && Object.keys(derived.params).length ? derived.params : null;
+});
+
+if (CONFIG.signerEnabled && CONFIG.signerPoolEnabled && CONFIG.signerRefreshMs > 0) {
+  signaturePool.start();
+}
+
+/**
+ * Imza baglamini olusturur. Secret ve cerezler yalnizca burada okunur;
+ * loglara veya API yanitlarina YAZILMAZ.
+ */
+function buildSignerContext(clipId, req, secretOverride) {
+  let cookieHeader = '';
+  if (req && typeof req.get === 'function' && req.get('cookie')) cookieHeader = String(req.get('cookie'));
+  if (!cookieHeader) {
+    cookieHeader = buildUpstreamCookieHeader(authState.accessToken || CONFIG.sessionToken || null) || '';
+  }
+
+  const headers = {};
+  if (req && req.headers) {
+    for (const [k, v] of Object.entries(req.headers)) headers[String(k).toLowerCase()] = v;
+  }
+
+  return {
+    clipId,
+    now: Date.now(),
+    secret: secretOverride !== undefined && secretOverride !== null ? String(secretOverride) : CONFIG.signerSecret,
+    cookieHeader,
+    query: (req && req.query) || {},
+    headers,
+  };
+}
+
+/**
+ * Istemcinin gonderdigi imza parametreleri.
+ *   1) X-Sign-Params: {"sig":"...","expires":"..."}   (JSON, en esnek)
+ *   2) Query: ?sig=...&expires=...                     (SIGNED_PARAM_KEYS allowlist)
+ * @returns {object|null}
+ */
+function collectClientSignature(req) {
+  if (!req) return null;
+  const params = {};
+
+  if (typeof req.get === 'function') {
+    const jsonHeader = req.get('x-sign-params');
+    if (jsonHeader) {
+      try {
+        const parsed = JSON.parse(jsonHeader);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          for (const [k, v] of Object.entries(parsed)) {
+            if (/^[A-Za-z0-9_-]{1,40}$/.test(k) && v !== undefined && v !== null) params[k] = String(v).slice(0, 2048);
+          }
+        }
+      } catch (_e) {
+        // gecersiz JSON -> yoksay (istek dusurulmez)
+      }
+    }
+  }
+
+  if (req.query) {
+    for (const key of SIGNED_PARAM_KEYS) {
+      const value = req.query[key];
+      if (value !== undefined && value !== null && value !== '') params[key] = String(value);
+    }
+  }
+
+  return Object.keys(params).length ? params : null;
+}
+
+/**
+ * Imza stratejisini secer ve parametreleri uretir. ASLA throw etmez.
+ * @returns {Promise<{strategy:string, params:object, errors:string[], from_pool:boolean}>}
+ */
+async function resolveSignature(clipId, req, opts = {}) {
+  const result = { strategy: 'none', params: {}, errors: [], from_pool: false };
+
+  if (!CONFIG.signerEnabled) {
+    result.strategy = 'disabled';
+    return result;
+  }
+
+  // 1) Istemci imzasi (en guvenilir kaynak: gercek tarayici degeri)
+  const client = collectClientSignature(req);
+  if (client) {
+    result.strategy = 'client';
+    result.params = client;
+    return result;
+  }
+
+  // 2) Havuz (arka planda tazelenmis parametreler)
+  if (CONFIG.signerPoolEnabled) {
+    const pooled = signaturePool.get(clipId);
+    if (pooled) {
+      result.strategy = 'pool';
+      result.params = pooled;
+      result.from_pool = true;
+      return result;
+    }
+  }
+
+  // 3) Matematiksel turetim (SIGNER_SPEC)
+  const spec = opts.spec || CONFIG.signerSpec;
+  if (spec) {
+    const derived = signer.deriveParams(spec, buildSignerContext(clipId, req, opts.secret));
+    result.errors = derived.errors || [];
+    if (derived.params && Object.keys(derived.params).length) {
+      result.strategy = 'derive';
+      result.params = derived.params;
+      if (CONFIG.signerPoolEnabled) {
+        signaturePool.put(clipId, derived.params, { source: 'derive', ttlMs: CONFIG.signerPoolTtlMs });
+      }
+      return result;
+    }
+    result.strategy = 'derive-failed';
+    return result;
+  }
+
+  return result;
+}
+
+/**
+ * Bir URL'den en fazla `maxBytes` bayt okur ve olcer (akisi istemciye gondermez).
+ * /debug/signer icin: "imzali URL gercekten bayt akitiyor mu?" sorusunun cevabi.
+ */
+async function probeUpstreamBytes(url, opts = {}) {
+  const maxBytes = Math.min(envInt(opts.maxBytes, 65536), 4 * 1024 * 1024);
+  const timeoutMs = envInt(opts.timeoutMs, 15000);
+  const startedAt = Date.now();
+
+  const headers = buildStreamUpstreamHeaders(opts.req || {}, null);
+  delete headers.Range; // tam govdeyi basindan okuyoruz, sonra kapatiyoruz
+
+  let upstream;
+  try {
+    upstream = await axios({
+      method: 'get',
+      url,
+      responseType: 'stream',
+      timeout: timeoutMs,
+      maxRedirects: 3,
+      decompress: false,
+      validateStatus: () => true,
+      headers,
+      httpsAgent: getUpstreamAgent(),
+      proxy: false,
+    });
+  } catch (err) {
+    return { performed: true, ok: false, error: sanitizeMessage(err.message), elapsed_ms: Date.now() - startedAt };
+  }
+
+  let bytes = 0;
+  let firstChunk = null;
+  let settled = false;
+
+  await new Promise((resolve) => {
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        upstream.data.destroy();
+      } catch (_e) {
+        /* zaten kapali */
+      }
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    upstream.data.on('data', (chunk) => {
+      if (!firstChunk && chunk && chunk.length) firstChunk = Buffer.from(chunk.subarray(0, 8));
+      bytes += chunk ? chunk.length : 0;
+      if (bytes >= maxBytes) finish();
+    });
+    upstream.data.on('end', finish);
+    upstream.data.on('error', finish);
+    upstream.data.on('close', finish);
+  });
+
+  const magic = firstChunk ? firstChunk.toString('hex') : null;
+  return {
+    performed: true,
+    ok: true,
+    status: upstream.status,
+    content_type: upstream.headers['content-type'] || null,
+    content_length: upstream.headers['content-length'] || null,
+    content_encoding: upstream.headers['content-encoding'] || null,
+    bytes_read: bytes,
+    empty: bytes === 0,
+    magic_hex: magic,
+    // ID3 / RIFF / fLaC / OggS -> cozulmemis ses basligi
+    plain_audio_magic: magic ? /^(494433|52494646|664c6143|4f676753)/.test(magic) : false,
+    elapsed_ms: Date.now() - startedAt,
+    read_cap_bytes: maxBytes,
+  };
+}
+
+/** /health ve /debug/signer icin kisa durum ozeti. */
+function signerStatus() {
+  const re = signer.RE_FINDINGS;
+  return {
+    enabled: CONFIG.signerEnabled,
+    spec_configured: Boolean(CONFIG.signerSpec),
+    spec_redacted: CONFIG.signerSpec ? CONFIG.signerSpec.replace(/\{secret\}/g, '{secret:***}').slice(0, 200) : null,
+    secret_set: Boolean(CONFIG.signerSecret),
+    strategies: ['client', 'pool', 'derive', 'none'],
+    pool: CONFIG.signerPoolEnabled ? signaturePool.stats_() : { enabled: false },
+    re: {
+      verdict: re.verdict,
+      scanned_at: re.scanned_at,
+      files_scanned: re.files_scanned,
+      summary: re.summary,
+    },
+  };
+}
+
+/**
+ * Klibin ses kaynagini cozer.
+ *  1. audio_url gercek bir CDN linkiyse onu kullanir (Pro plan).
+ *  2. Istemci dogrudan imzali adres verdiyse onu kullanir.
+ *  3. Aksi halde audiopipe sablonu + imza motoru (client/pool/derive/none).
+ *
+ * Not: yalnizca URL uretir; bayt donusumu YAPMAZ. `async` cunku imza
+ * stratejisi havuzdan (TTL'li) gelebilir.
+ */
+async function resolveAudioSource(clip, req) {
+  if (clip && clip.audio_url && !isForbiddenUrl(clip.audio_url)) {
+    return {
+      url: clip.audio_url,
+      source: 'cdn',
+      transparent: false,
+      signature: { strategy: 'none', params: {} },
+    };
+  }
+
+  // Istemci dogrudan imzali bir adres verdiyse onu kullan (allowlist kontrolu route'ta)
+  const clientUrl =
+    (req && (req.query.audio_url || req.query.signed_url)) ||
+    (req && req.get && (req.get('x-audio-url') || req.get('x-signed-url')));
+  if (clientUrl) {
+    return {
+      url: String(clientUrl),
+      source: 'client-signed',
+      transparent: true,
+      signature: { strategy: 'client-url', params: {} },
+    };
+  }
+
+  const filled = fillUrlTemplate(CONFIG.audiopipeUrlTemplate, clip.id, req);
+  const signature = await resolveSignature(clip.id, req);
+  let url = appendSignedParams(filled, req);
+  if (Object.keys(signature.params).length) {
+    url = signer.buildSignedUrl(url, signature.params);
+  }
+
+  return {
+    url,
+    source: 'audiopipe',
+    transparent: true,
+    signature: {
+      strategy: signature.strategy,
+      params: signature.params,
+      from_pool: signature.from_pool,
+      errors: signature.errors,
+    },
+  };
+}
+
+function slugifyText(text, fallback = 'audio') {
+  const slug = String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  return slug || fallback;
+}
+
+/** Suno'nun "forbidden" yer tutucu URL'sini tespit eder. */
+function isForbiddenUrl(u) {
+  return !u || /\/api\/forbidden/.test(String(u));
+}
+
+/** Suno klip nesnesini istemci icin sabit/sade bir sekle cevirir. */
+function normalizeClip(clip) {
+  if (!clip || !clip.id) return null;
+  const md = clip.metadata || {};
+  const audioUrl = isForbiddenUrl(clip.audio_url) ? null : clip.audio_url;
+
+  return {
+    id: clip.id,
+    status: clip.status || 'unknown', // submitted | queued | streaming | complete | error
+    is_complete: clip.status === 'complete',
+    is_error: clip.status === 'error',
+    title: clip.title || null,
+    tags: md.tags || null,
+    prompt: md.prompt || null,
+    duration_seconds: md.duration ?? null,
+    model: clip.model_name || null,
+    created_at: clip.created_at || null,
+    image_url: clip.image_url || null,
+    song_url: `https://suno.com/song/${clip.id}`,
+    // audio_url: yalnizca gercek CDN linki varsa (Pro plan). Free planda null.
+    audio_url: audioUrl,
+    // Proxy uzerinden indirme/akis (bizim sunucumuz)
+    download_url: `/download?id=${clip.id}`,
+    // Akis (browser'da <audio src> icin uygun; Range destegi yok)
+    stream_url: audioUrl ? `/download?id=${clip.id}&inline=1` : null,
+    // Neden indirilemiyor? (free plan)
+    download_blocked_reason: audioUrl
+      ? null
+      : 'Suno ucretsiz planda indirilebilir MP3 vermiyor (audio_url = /api/forbidden).',
+  };
+}
+
+/** Feed'den tek klip ceker. */
+async function fetchClip(clipId) {
+  const data = await sunoRequest('get', `${CONFIG.feedPath}?ids=${encodeURIComponent(clipId)}`);
+  const list = Array.isArray(data) ? data : (data && (data.clips || data.data)) || [];
+  return list.find((c) => c && c.id === clipId) || list[0] || null;
+}
+
+/** Express icin standart hata cevabi. */
+function sendError(res, status, code, message, detail) {
+  // BILINEN HATA DUZELTMESI: akis yolunda hata, basliklar gonderilmeden once
+  // olusursa `Content-Type: audio/mp3` set edilmis olabilir. JSON govdeyi
+  // "ses" olarak etiketlememek icin once Content-Type'i sil.
+  if (!res.headersSent) {
+    res.removeHeader('Content-Type');
+    res.removeHeader('Content-Disposition');
+    res.removeHeader('Accept-Ranges');
+    res.removeHeader('Content-Range');
+  }
+  return res.status(status).json({
+    ok: false,
+    error: { code, message, detail: detail ? sanitizeMessage(detail) : undefined },
+  });
+}
+
+// ============================================================================
+// 3. TOKEN / OTURUM YONETIMI  (Clerk Auth taklidi)
+// ============================================================================
+//
+//  Akis (tarayicinin yaptigiyla ayni):
+//
+//   (A) GET  {clerk}/v1/client?_clerk_js_version=X          [Cookie: __client=...]
+//         -> { response: { sessions: [ { id, status, last_active_token: { jwt } } ],
+//                          last_active_session_id } }
+//
+//   (B) POST {clerk}/v1/client/sessions/{sid}/tokens?_clerk_js_version=X
+//         -> { jwt: "eyJ..." }      <-- Suno API'sine Bearer olarak gonderilir
+//
+//   (C) POST {clerk}/v1/client/sessions/{sid}/touch?_clerk_js_version=X
+//         -> oturumun "aktif" sayilmasini saglar (7/24 ayakta kalma)
+//
+// ============================================================================
+
+/** Bellekteki oturum durumu (process basina tek). */
+const authState = {
+  accessToken: null,   // gecerli Bearer JWT
+  expiresAt: 0,        // JWT exp (ms) - 0 ise bilinmiyor
+  sessionId: null,     // Clerk session id
+  lastRefreshAt: 0,    // son basarili yenileme zamani
+  lastError: null,     // son hata mesaji (debug icin)
+  refreshCount: 0,     // toplam yenileme sayisi
+  inFlight: null,      // devam eden yenileme promise'i (single-flight)
+};
+
+/**
+ * .env'den gelen degeri Cookie header formatina cevirir.
+ * Kullanici ister sadece degeri, ister "Cookie: a=b; __client=xyz" seklinde
+ * tum header'i yapistirmis olabilir; iki durumu da destekliyoruz.
+ */
+function buildCookieHeader() {
+  const raw = CONFIG.refreshToken;
+  if (!raw) return '';
+  if (raw.includes('__client=')) {
+    // Icinden __client=... kisimini ayikla.
+    const match = raw.match(/__client=([^;]+)/);
+    return match ? `__client=${match[1].trim()}` : raw;
+  }
+  return `__client=${raw}`;
+}
+
+function requireRefreshToken() {
+  if (!CONFIG.refreshToken) {
+    throw new Error(
+      'SUNO_REFRESH_TOKEN tanimli degil. suno.com -> F12 -> Application -> Cookies -> __client degerini .env dosyasina ekleyin.',
+    );
+  }
+}
+
+/**
+ * (A) Clerk client bilgisini cek: session id + son aktif token.
+ * sessionId zaten biliniyorsa yalnizca gerektiginde cagrilir.
+ */
+async function fetchClerkClient() {
+  requireRefreshToken();
+
+  const url = `${CONFIG.clerkBaseUrl}/v1/client?_clerk_js_version=${encodeURIComponent(CONFIG.clerkJsVersion)}`;
+
+  const { data } = await axios.get(url, {
+    timeout: CONFIG.requestTimeoutMs,
+    headers: {
+      Cookie: buildCookieHeader(),
+      Accept: '*/*',
+      'User-Agent': BROWSER_UA,
+      Origin: 'https://suno.com',
+      Referer: 'https://suno.com/',
+    },
+    // 4xx'leri de yakalayip anlamli hata uretmek icin:
+    validateStatus: (status) => status >= 200 && status < 400,
+  });
+
+  const client = data && (data.response || data);
+  const sessions = Array.isArray(client && client.sessions) ? client.sessions : [];
+
+  if (!sessions.length) {
+    throw new Error(
+      'Clerk oturumu bulunamadi. __client cookie suresi dolmus veya gecersiz olabilir; suno.com uzerinden yeni cookie alin.',
+    );
+  }
+
+  // En uygun oturumu sec: aktif olan > last_active_session_id > ilk siradaki
+  const activeSession =
+    sessions.find((s) => s && s.status === 'active') ||
+    sessions.find((s) => s && s.id === client.last_active_session_id) ||
+    sessions[0];
+
+  return {
+    sessionId: activeSession.id,
+    fallbackJwt: (activeSession.last_active_token && activeSession.last_active_token.jwt) || null,
+  };
+}
+
+/**
+ * (B) Session id'den taze JWT al.
+ * Clerk burada yeni bir access token uretir; bu token Suno API'sinde Bearer
+ * olarak kullanilir.
+ */
+async function requestSessionToken(sessionId) {
+  requireRefreshToken();
+
+  const url =
+    `${CONFIG.clerkBaseUrl}/v1/client/sessions/${encodeURIComponent(sessionId)}/tokens` +
+    `?_clerk_js_version=${encodeURIComponent(CONFIG.clerkJsVersion)}`;
+
+  const { data } = await axios.post(url, null, {
+    timeout: CONFIG.requestTimeoutMs,
+    headers: {
+      Cookie: buildCookieHeader(),
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Length': '0',
+      Accept: '*/*',
+      'User-Agent': BROWSER_UA,
+      Origin: 'https://suno.com',
+      Referer: 'https://suno.com/',
+    },
+    validateStatus: (status) => status >= 200 && status < 400,
+  });
+
+  const jwt = data && (data.jwt || (data.response && data.response.jwt));
+  if (!jwt) {
+    throw new Error('Clerk token yanitinda "jwt" alani yok. Yanit formati degismis olabilir.');
+  }
+  return jwt;
+}
+
+/**
+ * (C) Keep-alive: oturumu "dokunulmus" isaretle.
+ * Bu cagri olmadan Clerk oturumu hareketsizlikten dusurebilir.
+ * Hata olursa akisi bozmuyoruz (kritik degil, sadece uyari logluyoruz).
+ */
+async function touchSession(sessionId) {
+  const url =
+    `${CONFIG.clerkBaseUrl}/v1/client/sessions/${encodeURIComponent(sessionId)}/touch` +
+    `?_clerk_js_version=${encodeURIComponent(CONFIG.clerkJsVersion)}`;
+
+  try {
+    await axios.post(url, null, {
+      timeout: CONFIG.requestTimeoutMs,
+      headers: {
+        Cookie: buildCookieHeader(),
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': '0',
+        Accept: '*/*',
+        'User-Agent': BROWSER_UA,
+        Origin: 'https://suno.com',
+        Referer: 'https://suno.com/',
+      },
+      validateStatus: (status) => status >= 200 && status < 400,
+    });
+    log('debug', 'Clerk session/touch basarili.', { sessionId });
+  } catch (err) {
+    log('warn', 'Clerk session/touch basarisiz (kritik degil).', sanitizeMessage(err.message));
+  }
+}
+
+/**
+ * Token'i yenile. Single-flight: ayni anda birden fazla cagri gelirse
+ * tek bir Promise paylasilir.
+ *
+ * @param {boolean} force true ise token suresi dolmamis olsa bile yenilenir.
+ * @returns {Promise<string>} gecerli access token
+ */
+async function refreshAccessToken(force = false) {
+  // __client yoksa yenileme yapilamaz; elle yapistirilmis JWT varsa onu ver.
+  if (!CONFIG.refreshToken) {
+    if (CONFIG.sessionToken) return CONFIG.sessionToken;
+    throw new Error('Yenileme icin SUNO_REFRESH_TOKEN (__client) gerekli.');
+  }
+
+  // Hala gecerliyse ve zorlanmiyorsa mevcut token'i dondur.
+  const now = Date.now();
+  const stillValid =
+    authState.accessToken && (authState.expiresAt === 0 || authState.expiresAt - CONFIG.refreshBeforeExpiryMs > now);
+  if (!force && stillValid) return authState.accessToken;
+
+  // Devam eden bir yenileme varsa onu bekle.
+  if (authState.inFlight) return authState.inFlight;
+
+  authState.inFlight = (async () => {
+    const startedAt = Date.now();
+    try {
+      // 1) Session id yoksa Clerk'ten ogren.
+      if (!authState.sessionId) {
+        const { sessionId, fallbackJwt } = await fetchClerkClient();
+        authState.sessionId = sessionId;
+        if (fallbackJwt) {
+          authState.accessToken = fallbackJwt;
+          authState.expiresAt = getTokenExpiryMs(fallbackJwt);
+        }
+      }
+
+      // 2) Taze JWT iste.
+      let jwt;
+      try {
+        jwt = await requestSessionToken(authState.sessionId);
+      } catch (tokenErr) {
+        // Session id eskimis olabilir -> Clerk'ten yeniden ogrenip 1 kez tekrar dene.
+        log('warn', 'Token istegi basarisiz, session id yeniden cozuluyor.', sanitizeMessage(tokenErr.message));
+        const { sessionId, fallbackJwt } = await fetchClerkClient();
+        authState.sessionId = sessionId;
+        try {
+          jwt = await requestSessionToken(sessionId);
+        } catch (retryErr) {
+          // Son sans: last_active_token.jwt (yine de ise yarayabilir).
+          if (fallbackJwt) {
+            log('warn', 'tokens uc noktasi basarisiz, last_active_token.jwt kullaniliyor.');
+            jwt = fallbackJwt;
+          } else {
+            throw retryErr;
+          }
+        }
+      }
+
+      // 3) Bellege yaz.
+      authState.accessToken = jwt;
+      authState.expiresAt = getTokenExpiryMs(jwt);
+      authState.lastRefreshAt = Date.now();
+      authState.lastError = null;
+      authState.refreshCount += 1;
+
+      const ttlSec = authState.expiresAt ? Math.round((authState.expiresAt - Date.now()) / 1000) : null;
+      log('info', 'Access token yenilendi.', {
+        sessionId: authState.sessionId,
+        ttlSeconds: ttlSec,
+        tookMs: Date.now() - startedAt,
+      });
+
+      return jwt;
+    } catch (err) {
+      authState.lastError = sanitizeMessage(err.message);
+      // Hatayi etiketle: route katmani bunu 500 yerine anlamli bir 502'ye cevirsin.
+      err.code = err.code || 'AUTH_ERROR';
+      err.isAuthError = true;
+      log('error', 'Token yenileme basarisiz.', authState.lastError);
+      throw err;
+    } finally {
+      authState.inFlight = null;
+    }
+  })();
+
+  return authState.inFlight;
+}
+
+/**
+ * Her API isteginden hemen once cagrilir: token gecerli mi kontrol eder,
+ * gerekirse yeniler. Boylece "token suresi doldu" hatalari kullaniciya
+ * yansimaz.
+ */
+async function getValidToken() {
+  // (0) __client yok ama elle yapistirilmis bir JWT varsa: dogrudan onu kullan.
+  if (!CONFIG.refreshToken) {
+    if (CONFIG.sessionToken) {
+      authState.accessToken = CONFIG.sessionToken;
+      authState.expiresAt = getTokenExpiryMs(CONFIG.sessionToken);
+      return CONFIG.sessionToken;
+    }
+    throw new Error(
+      'Kimlik bilgisi yok. SUNO_REFRESH_TOKEN (__client) veya SUNO_SESSION_TOKEN (__session JWT) tanimlayin.',
+    );
+  }
+
+  const now = Date.now();
+  const hasToken = Boolean(authState.accessToken);
+  const expiringSoon = authState.expiresAt !== 0 && authState.expiresAt - CONFIG.refreshBeforeExpiryMs <= now;
+
+  if (hasToken && !expiringSoon) return authState.accessToken;
+  return refreshAccessToken(!hasToken); // token yoksa force=true gibi davran
+}
+
+// ============================================================================
+// 4. SUNO STUDIO API ISTEMCISI
+// ============================================================================
+
+/**
+ * Suno'nun web bundle'indan (chunk: 2uv-qdm-0aanh.js) birebir alinan algoritma:
+ *
+ *   const payload = { token: btoa(JSON.stringify({ timestamp: Date.now() })) };
+ *   headers['Browser-Token'] = JSON.stringify(payload);
+ *
+ * Yani header degeri DUZ base64 DEGIL, icinde base64 tasiyan bir JSON string'idir:
+ *   {"token":"eyJ0aW1lc3RhbXAiOjE3OTIzNzgzMzA5NDV9"}
+ * Bu header olmadan Suno 401 dondurur (anti-replay korumasi).
+ */
+function buildBrowserToken() {
+  if (CONFIG.browserTokenOverride) return CONFIG.browserTokenOverride;
+  try {
+    const inner = JSON.stringify({ timestamp: Date.now() });
+    return JSON.stringify({ token: Buffer.from(inner, 'utf8').toString('base64') });
+  } catch (_err) {
+    return JSON.stringify({ token: 'error' });
+  }
+}
+
+/** Cihaz kimligi: env > __client cookie'sindeki suno_device_id > kalici UUID. */
+function resolveDeviceId() {
+  if (CONFIG.deviceId) return CONFIG.deviceId;
+  // Ham cookie dokumunden gelen suno_device_id varsa onu kullan.
+  const match = String(process.env.SUNO_COOKIE_JAR || '').match(/suno_device_id=([^;\s]+)/);
+  if (match) return match[1];
+  if (!resolveDeviceId._fallback) {
+    resolveDeviceId._fallback = require('crypto').randomUUID();
+    log('warn', 'SUNO_DEVICE_ID tanimli degil, rastgele uretildi.', resolveDeviceId._fallback);
+  }
+  return resolveDeviceId._fallback;
+}
+
+/** Suno API'sine gonderilecek ortak header seti. */
+function buildSunoHeaders(token) {
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+    Accept: '*/*',
+    'User-Agent': BROWSER_UA,
+    Origin: 'https://suno.com',
+    Referer: 'https://suno.com/',
+  };
+
+  // Anti-replay + cihaz kimligi. Suno 2026-05'ten beri bunlari zorunlu tutuyor.
+  headers['Browser-Token'] = buildBrowserToken();
+  headers['Device-Id'] = resolveDeviceId();
+
+  // __client cookie'sini de iletiyoruz (bazi uc noktalar istiyor).
+  if (CONFIG.forwardClientCookie && CONFIG.refreshToken) {
+    headers.Cookie = buildCookieHeader();
+  }
+
+  return headers;
+}
+
+/**
+ * Suno API'sine istek atar.
+ * 401 alinirsa token'i zorla yenileyip 1 kez tekrar dener (retry-on-401).
+ *
+ * @param {'get'|'post'} method
+ * @param {string} path  orn: "/api/generate/v2/"
+ * @param {object} [body]
+ */
+async function sunoRequest(method, path, body) {
+  const url = `${CONFIG.sunoApiBase}${path}`;
+
+  const execute = async (forceRefresh) => {
+    const token = forceRefresh ? await refreshAccessToken(true) : await getValidToken();
+    const config = {
+      method,
+      url,
+      timeout: CONFIG.requestTimeoutMs,
+      headers: buildSunoHeaders(token),
+      // 4xx'leri kendimiz yorumlayacagiz -> axios throw etmesin.
+      validateStatus: () => true,
+    };
+    if (body !== undefined) config.data = body;
+    return axios.request(config);
+  };
+
+  let response = await execute(false);
+
+  // 401/403: yalnizca gercekten yenileyebiliyorsak (__client varsa) tekrar dene.
+  if ((response.status === 401 || response.status === 403) && CONFIG.refreshToken) {
+    log('warn', `Suno API ${response.status} dondurdu, token zorla yenilenip tekrar denenecek.`, path);
+    response = await execute(true);
+  }
+
+  if (response.status < 200 || response.status >= 300) {
+    const detail =
+      typeof response.data === 'string' ? response.data : JSON.stringify(response.data || {}).slice(0, 500);
+    const err = new Error(`Suno API hatasi (HTTP ${response.status})`);
+    err.status = response.status;
+    err.detail = detail;
+    err.responseData = response.data;
+    throw err;
+  }
+
+  return response.data;
+}
+
+// ============================================================================
+// 4.5 SAGLAYICI (PROVIDER) KATMANI
+// ============================================================================
+//
+//  AUDIO_PROVIDER=suno|replicate|elevenlabs|mock
+//
+//  Tum route'lar yalnizca provider arayuzunu bilir. Saglayici degistirmek icin
+//  istemci uygulamasinda HICBIR degisiklik gerekmez.
+//
+// ============================================================================
+
+const activeProvider = () => providerRegistry.getProvider();
+
+// Suno adaptoru, bu dosyadaki hazir fonksiyonlari kullanir (kod tekrari yok).
+providerRegistry.providers.suno.init({
+  sunoRequest,
+  fetchClip,
+  normalizeClip,
+  resolveAudioSource,
+  runStreamHandshake,
+  modelFallback: CONFIG.modelFallback,
+  defaultModel: CONFIG.defaultModel,
+  defaultInstrumental: CONFIG.defaultInstrumental,
+  generatePath: CONFIG.generatePath,
+  hasRefreshToken: Boolean(CONFIG.refreshToken),
+  hasSessionToken: Boolean(CONFIG.sessionToken),
+});
+
+/**
+ * Saglayici "internal://" kaynagi dondurduyse (mock / elevenlabs gibi bellek ici
+ * kayitlar), sesi Range destekli olarak dogrudan bellekten akitir.
+ *
+ *   internal://mock/<clipId>
+ *   internal://elevenlabs/<clipId>
+ */
+async function pipeInternalAudio(req, res, internalUrl) {
+  const providerName = String(internalUrl).replace('internal://', '').split('/')[0];
+  const clipId = String(internalUrl).split('/').pop();
+
+  let buffer = null;
+  let contentType = 'audio/mpeg';
+
+  if (providerName === 'mock') {
+    const rendered = providerRegistry.providers.mock.render(clipId);
+    if (!rendered) return sendError(res, 404, 'TRACK_NOT_FOUND', `Klip bulunamadi: ${clipId}`);
+    buffer = rendered.buffer;
+    contentType = rendered.contentType;
+  } else if (providerName === 'elevenlabs') {
+    const record = providerRegistry.providers.elevenlabs.getRecord(clipId);
+    if (!record) return sendError(res, 404, 'TRACK_NOT_FOUND', `Klip bulunamadi (bellekte yok): ${clipId}`);
+    buffer = record.buffer;
+    contentType = record.contentType;
+  } else {
+    return sendError(res, 502, 'INTERNAL_SOURCE_UNKNOWN', `Bilinmeyen ic kaynak: ${providerName}`);
+  }
+
+  const total = buffer.length;
+  const range = parseRangeHeader(req.headers.range, total);
+  const baseHeaders = {
+    'Content-Type': contentType,
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'public, max-age=3600',
+    'Access-Control-Allow-Origin': req.get('origin') || '*',
+    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Content-Type',
+    'X-Proxy-Mode': `internal:${providerName}`,
+  };
+  for (const [k, v] of Object.entries(baseHeaders)) res.setHeader(k, v);
+
+  if (range && range.unsatisfiable) {
+    res.setHeader('Content-Range', `bytes */${total}`);
+    return sendError(res, 416, 'RANGE_NOT_SATISFIABLE', 'Istenen bayt araligi dosya boyutunu asiyor.');
+  }
+
+  if (range) {
+    const end = range.end === null ? total - 1 : Math.min(range.end, total - 1);
+    res.status(206);
+    res.setHeader('Content-Range', `bytes ${range.start}-${end}/${total}`);
+    res.setHeader('Content-Length', String(end - range.start + 1));
+    return res.end(buffer.subarray(range.start, end + 1));
+  }
+
+  res.setHeader('Content-Length', String(total));
+  return res.end(buffer);
+}
+
+// ============================================================================
+// 5. EXPRESS UYGULAMASI
+// ============================================================================
+
+const app = express();
+app.disable('x-powered-by');
+app.set('trust proxy', 1); // Render / reverse proxy arkasinda dogru IP
+app.use(express.json({ limit: '64kb' })); // kucuk limit -> dusuk bellek
+
+/** Basit istek loglama (UptimeRobot trafigini gurultuye bogmamak icin /ping haric). */
+app.use((req, _res, next) => {
+  if (req.path !== '/ping') log('debug', `${req.method} ${req.path}`);
+  next();
+});
+
+/**
+ * NOT: Eski `authGuard` kaldirildi. Tum korumali rotalar artik `apiKeyGuard`
+ * kullaniyor; eski tek anahtar (API_KEY) bu kontrolun icinde destekleniyor.
+ * Geriye uyumluluk icin `API_KEY` degiskeni hala gecerlidir (bkz. CONFIG).
+ */
+
+/**
+ * Zamanlama saldirilarina dayanikli anahtar karsilastirmasi.
+ * Uzunluk sizdirilmaz: once uzunluk kontrolu, sonra timingSafeEqual.
+ */
+function safeKeyEqual(a, b) {
+  const ba = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ba.length !== bb.length) return false;
+  try {
+    return crypto.timingSafeEqual(ba, bb);
+  } catch (_e) {
+    return false;
+  }
+}
+
+/**
+ * PROJE GENELI API ANAHTARI KORUMASI
+ * ----------------------------------
+ * Kabul edilen kaynaklar (sirayla):
+ *   1. x-api-key: <key>
+ *   2. ?api_key=<key>            -> <audio src> gibi header gonderemeyen istemciler icin
+ *   3. Authorization: Bearer <key>
+ *
+ * Anahtar listesi: ALLOWED_API_KEYS (virgulle ayrilmis) + eski API_KEY.
+ * Liste bos ise:
+ *   - API_KEY_REQUIRED=true  -> 401 (siki mod)
+ *   - aksi halde             -> istek gecer + log uyarisi (demo modu)
+ */
+function apiKeyGuard(req, res, next) {
+  const configured = CONFIG.allowedApiKeys;
+
+  if (!configured.length) {
+    if (CONFIG.apiKeyRequired) {
+      return sendError(
+        res,
+        401,
+        'UNAUTHORIZED',
+        'Sunucuda API anahtari tanimli degil (ALLOWED_API_KEYS) ve siki mod acik.',
+      );
+    }
+    return next();
+  }
+
+  const bearer = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
+  const provided = String(req.get('x-api-key') || (req.query && req.query.api_key) || bearer || '').trim();
+
+  if (!provided) {
+    return sendError(res, 401, 'UNAUTHORIZED', 'API anahtari gerekli (x-api-key veya ?api_key=).');
+  }
+
+  const ok = configured.some((key) => safeKeyEqual(key, provided));
+  if (!ok) {
+    log('warn', 'Gecersiz API anahtari.', {
+      ip: req.ip,
+      path: req.path,
+      keyPrefix: `${provided.slice(0, 4)}…`,
+    });
+    return sendError(res, 401, 'UNAUTHORIZED', 'Gecersiz API anahtari.');
+  }
+
+  return next();
+}
+
+// ---------------------------------------------------------------------------
+// GET /ping  -> UptimeRobot / Render health check
+// ---------------------------------------------------------------------------
+app.get('/ping', (_req, res) => {
+  // Mumkun oldugunca hafif cevap: JSON yok, islem yok.
+  res.type('text/plain').send('pong');
+});
+
+// ---------------------------------------------------------------------------
+// GET /health -> detayli durum (uptime, token ttl, oturum bilgisi)
+// ---------------------------------------------------------------------------
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    uptimeSeconds: Math.round(process.uptime()),
+    memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    auth: {
+      hasRefreshToken: Boolean(CONFIG.refreshToken),
+      hasSessionToken: Boolean(CONFIG.sessionToken),
+      hasAccessToken: Boolean(authState.accessToken),
+      sessionId: authState.sessionId,
+      tokenExpiresInSeconds: authState.expiresAt ? Math.max(0, Math.round((authState.expiresAt - Date.now()) / 1000)) : null,
+      lastRefreshAt: authState.lastRefreshAt ? new Date(authState.lastRefreshAt).toISOString() : null,
+      refreshCount: authState.refreshCount,
+      lastError: authState.lastError,
+    },
+    provider: {
+      name: providerRegistry.getProviderName(),
+      available: providerRegistry.listProviders(),
+      audioEndpointConfigured:
+        providerRegistry.getProviderName() === 'suno'
+          ? Boolean(CONFIG.refreshToken || CONFIG.sessionToken)
+          : undefined,
+    },
+    tls: {
+      chromeProfile: CONFIG.chromeTlsProfile,
+      ciphers: CONFIG.chromeTlsProfile ? CHROME_CIPHER_SUITES.split(':').length : null,
+    },
+    handshake: {
+      enabled: CONFIG.enableSessionHandshake,
+      milestones: CONFIG.handshakeMilestones,
+      runs: handshakeState.runs,
+      lastResult: handshakeState.lastResult,
+      lastSessionId: handshakeState.lastSessionId
+        ? `${String(handshakeState.lastSessionId).slice(0, 16)}...`
+        : null,
+      lastError: handshakeState.lastError,
+    },
+    security: {
+      apiKeyRequired: CONFIG.allowedApiKeys.length > 0 || CONFIG.apiKeyRequired,
+      allowedApiKeys: CONFIG.allowedApiKeys.length,
+      dashboard: Boolean(CONFIG.publicDir),
+    },
+    signer: signerStatus(),
+    config: {
+      sunoApiBase: CONFIG.sunoApiBase,
+      generatePath: CONFIG.generatePath,
+      clerkBaseUrl: CONFIG.clerkBaseUrl,
+      defaultModel: CONFIG.defaultModel,
+    },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/refresh -> token'i manuel yenile (debug / kurtarma)
+// ---------------------------------------------------------------------------
+app.post('/auth/refresh', apiKeyGuard, async (_req, res) => {
+  try {
+    const token = await refreshAccessToken(true);
+    res.json({
+      ok: true,
+      renewed: true,
+      sessionId: authState.sessionId,
+      tokenExpiresInSeconds: authState.expiresAt
+        ? Math.max(0, Math.round((authState.expiresAt - Date.now()) / 1000))
+        : null,
+      tokenPreview: `${token.slice(0, 12)}...`,
+    });
+  } catch (err) {
+    return sendError(res, 502, 'TOKEN_REFRESH_FAILED', 'Oturum yenilenemedi.', err.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/token  -> calisirken taze JWT yapistir (redeploy GEREKMEZ)
+//   Body: { "token": "eyJ..." }   (tarayicida: await window.Clerk.session.getToken())
+// ---------------------------------------------------------------------------
+app.post('/auth/token', apiKeyGuard, async (req, res) => {
+  const token = typeof (req.body && req.body.token) === 'string' ? req.body.token.trim() : '';
+  if (!token || !token.includes('.')) {
+    return sendError(res, 400, 'INVALID_TOKEN', '{ "token": "<JWT>" } bekleniyor.');
+  }
+
+  // --- Imza dogrulamasi: bozuk/sahte token'i Suno'ya gondermeden yakala ---
+  const check = await verifyJwtSignature(token);
+  if (check.signatureValid === false && req.query.force !== '1') {
+    return sendError(
+      res,
+      400,
+      'TOKEN_SIGNATURE_INVALID',
+      'Token imzasi Suno anahtarlariyla dogrulanamadi: kopyalama bozulmus veya token sahte. ' +
+        'Konsolda: await navigator.clipboard.writeText(await window.Clerk.session.getToken())',
+      `signature_valid=false, expired=${check.expired}`,
+    );
+  }
+  if (check.expired) {
+    return sendError(res, 400, 'TOKEN_EXPIRED', 'Token suresi dolmus, yeni bir taze JWT alin.', 
+      `expires_in_seconds=${check.expiresInSeconds}`);
+  }
+
+  CONFIG.sessionToken = token;
+  authState.accessToken = token;
+  authState.expiresAt = getTokenExpiryMs(token);
+  authState.lastRefreshAt = Date.now();
+  authState.lastError = null;
+  log('info', 'Session token runtime\'da guncellendi.');
+  res.json({
+    ok: true,
+    tokenExpiresInSeconds: authState.expiresAt ? Math.max(0, Math.round((authState.expiresAt - Date.now()) / 1000)) : null,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /token/verify  -> eldeki/yeni JWT'yi Suno anahtarlariyla dogrula
+// ---------------------------------------------------------------------------
+app.get('/token/verify', apiKeyGuard, async (req, res) => {
+  const token = String(req.query.token || CONFIG.sessionToken || CONFIG.refreshToken || '').trim();
+  if (!token) return sendError(res, 400, 'NO_TOKEN', 'Dogrulanacak token yok.');
+  try {
+    const check = await verifyJwtSignature(token);
+    const payload = decodeJwtPayload(token) || {};
+    res.json({
+      ok: true,
+      ...check,
+      kid: payload && payload.kid,
+      sessionId: payload.sid,
+      handle: payload['suno/handle'],
+      plan: payload.plan,
+      length: token.length,
+    });
+  } catch (err) {
+    return sendError(res, 500, 'VERIFY_FAILED', 'Dogrulama yapilamadi.', err.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /generate-beat  -> beat / muzik uretimi
+// ---------------------------------------------------------------------------
+//  Istek:
+//    {
+//      "prompt": "Hard trap beat, 140bpm, dark piano, 808 slides",
+//      "make_instrumental": true,
+//      "tags": "trap, dark, 140bpm",        // opsiyonel
+//      "title": "Midnight 808",             // opsiyonel
+//      "model": "chirp-v4",                 // opsiyonel (mv)
+//      "wait": false,                       // opsiyonel: true -> olusumu bekle
+//      "waitTimeoutMs": 180000,             // opsiyonel
+//      "extra": { }                         // opsiyonel: Suno payload'ina eklenir
+//    }
+//
+//  Cevap (Suno'nun ham cevabi + meta):
+//    { ok: true, request: {...}, clips: [...], suno: <ham yanit> }
+// ---------------------------------------------------------------------------
+app.post('/generate-beat', apiKeyGuard, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const provider = activeProvider();
+    const providerName = providerRegistry.getProviderName();
+
+    // ---- 1) Dogrulama ----
+    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+    if (!prompt) {
+      return sendError(res, 400, 'INVALID_PROMPT', '"prompt" alani zorunludur ve bos olamaz.');
+    }
+    if (prompt.length > 2000) {
+      return sendError(res, 400, 'PROMPT_TOO_LONG', '"prompt" en fazla 2000 karakter olabilir.');
+    }
+
+    const configured = await provider.isConfigured();
+    if (!configured) {
+      return sendError(
+        res,
+        503,
+        'PROVIDER_NOT_CONFIGURED',
+        `Aktif saglayici (${providerName}) yapilandirilmamis.`,
+        'Gerekli API anahtarlarini .env dosyasina ekleyin veya AUDIO_PROVIDER degistirin.',
+      );
+    }
+
+    log('info', 'Uretim istegi gonderiliyor.', {
+      provider: providerName,
+      promptLength: prompt.length,
+      instrumental: body.make_instrumental,
+      model: body.model || null,
+    });
+
+    // ---- 2) Saglayiciya devret ----
+    const result = await provider.generate({
+      prompt,
+      tags: typeof body.tags === 'string' ? body.tags : '',
+      title: typeof body.title === 'string' ? body.title : '',
+      instrumental:
+        typeof body.make_instrumental === 'boolean' ? body.make_instrumental : CONFIG.defaultInstrumental,
+      model: typeof body.model === 'string' && body.model ? body.model : null,
+      extra: body.extra && typeof body.extra === 'object' ? body.extra : null,
+    });
+
+    // ---- 3) Opsiyonel: olusum bitene kadar bekle ----
+    let clips = (result && result.clips) || [];
+    let timedOut = false;
+
+    if (body.wait === true && result.clip_ids && result.clip_ids.length) {
+      const timeoutMs = Math.min(envInt(body.waitTimeoutMs, 180000), 300000);
+      const deadline = Date.now() + timeoutMs;
+
+      while (Date.now() < deadline) {
+        await sleep(4000);
+        try {
+          const fresh = [];
+          for (const id of result.clip_ids) {
+            // eslint-disable-next-line no-await-in-loop
+            const c = await provider.getTrack(id);
+            if (c) fresh.push(c);
+          }
+          if (fresh.length) clips = fresh;
+          if (fresh.length && fresh.every((c) => c.is_complete || c.is_error)) break;
+        } catch (pollErr) {
+          log('warn', 'Tracking sorgusu basarisiz.', sanitizeMessage(pollErr.message));
+        }
+      }
+      timedOut = !(clips.length && clips.every((c) => c.is_complete || c.is_error));
+    }
+
+    // ---- 4) Cevap (sozlesme Suno ile ayni) ----
+    return res.status(200).json({
+      ok: true,
+      provider: providerName,
+      request: {
+        prompt,
+        make_instrumental:
+          typeof body.make_instrumental === 'boolean' ? body.make_instrumental : CONFIG.defaultInstrumental,
+        model: body.model || null,
+      },
+      clip_ids: (result && result.clip_ids) || [],
+      clips,
+      waited: body.wait === true,
+      wait_timed_out: timedOut,
+      raw: req.query.raw === '1' ? (result && result.raw) || null : undefined,
+    });
+  } catch (err) {
+    // ---- Hata haritalama ----
+    const status = err.status;
+
+    if (err.isAuthError) {
+      return sendError(res, 502, 'SUNO_AUTH_FAILED', 'Oturum yenilenemedi.', err.message);
+    }
+    if (status === 403) {
+      return sendError(
+        res,
+        403,
+        err.code || 'MODEL_NOT_AVAILABLE',
+        'Istenen model bu hesapta kullanilamiyor.',
+        err.detail,
+      );
+    }
+    if (status === 402) {
+      return sendError(res, 402, 'INSUFFICIENT_CREDITS', 'Kredi yetersiz.', err.detail);
+    }
+    if (status === 429) {
+      return sendError(res, 429, 'RATE_LIMITED', 'Istek limiti asildi, biraz sonra tekrar deneyin.', err.detail);
+    }
+    if (status === 401) {
+      return sendError(
+        res,
+        502,
+        'SUNO_AUTH_FAILED',
+        'Suno token reddetti (401). Taze JWT gerekli: POST /auth/token.',
+        err.detail,
+      );
+    }
+    if (status === 503) {
+      return sendError(res, 503, err.code || 'PROVIDER_NOT_CONFIGURED', err.message, err.detail);
+    }
+    if (status) {
+      return sendError(res, 502, err.code || 'PROVIDER_ERROR', `Saglayici ${status} dondurdu.`, err.detail);
+    }
+    if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+      return sendError(res, 504, 'UPSTREAM_TIMEOUT', 'Saglayici zaman asimina ugradi.');
+    }
+
+    log('error', 'generate-beat beklenmeyen hata.', err.message);
+    return sendError(res, 500, 'INTERNAL_ERROR', 'Beklenmeyen bir hata olustu.', err.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /clips?ids=a,b,c -> klip durumlarini sorgula (opsiyonel yardimci)
+// ---------------------------------------------------------------------------
+app.get('/clips', apiKeyGuard, async (req, res) => {
+  try {
+    const ids = String(req.query.ids || '').trim();
+    if (!ids) return sendError(res, 400, 'MISSING_IDS', '"ids" query parametresi zorunludur (virgulle ayrilmis).');
+
+    const data = await sunoRequest('get', `${CONFIG.feedPath}?ids=${encodeURIComponent(ids)}`);
+    return res.json({ ok: true, data });
+  } catch (err) {
+    return sendError(res, 502, 'SUNO_API_ERROR', 'Klip bilgisi alinamadi.', err.detail || err.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /track/:id  ->  durum sorgulama (polling) + sarki bilgisi
+// ---------------------------------------------------------------------------
+//  Query:
+//    ?wait=true            -> complete/error olana kadar bekle (varsayilan 120 sn)
+//    ?waitTimeoutMs=60000  -> bekleme ust siniri (max 300000)
+//    ?raw=1                -> Suno'nun ham klip nesnesini de dondur
+//
+//  Ornek:  GET /track/afaea7cd-244b-4b00-9a5b-93152f74d285?wait=true
+// ---------------------------------------------------------------------------
+app.get('/track/:id', apiKeyGuard, async (req, res) => {
+  try {
+    const clipId = String(req.params.id || '').trim();
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(clipId)) {
+      return sendError(res, 400, 'INVALID_ID', 'Gecersiz klip id formati.');
+    }
+
+    const provider = activeProvider();
+    const providerName = providerRegistry.getProviderName();
+
+    let track = await provider.getTrack(clipId);
+    if (!track) {
+      return sendError(res, 404, 'TRACK_NOT_FOUND', `Klip bulunamadi: ${clipId}`);
+    }
+
+    // --- Opsiyonel: tamamlanana kadar bekle ---
+    let waited = false;
+    let timedOut = false;
+    if (req.query.wait === 'true' && !track.is_complete && !track.is_error) {
+      const timeoutMs = Math.min(envInt(req.query.waitTimeoutMs, 120000), 300000);
+      const deadline = Date.now() + timeoutMs;
+      waited = true;
+
+      while (Date.now() < deadline) {
+        await sleep(4000);
+        try {
+          const fresh = await provider.getTrack(clipId);
+          if (fresh) track = fresh;
+          if (fresh && (fresh.is_complete || fresh.is_error)) break;
+        } catch (pollErr) {
+          log('warn', 'Tracking sorgusu basarisiz.', sanitizeMessage(pollErr.message));
+        }
+      }
+      timedOut = !(track.is_complete || track.is_error);
+    }
+
+    return res.json({
+      ok: true,
+      provider: providerName,
+      track,
+      waited,
+      wait_timed_out: timedOut,
+      ...(req.query.raw === '1' ? { raw: track } : {}),
+    });
+  } catch (err) {
+    if (err.status) {
+      return sendError(res, 502, err.code || 'PROVIDER_ERROR', err.message, err.detail);
+    }
+    return sendError(res, 502, 'PROVIDER_ERROR', 'Klip durumu alinamadi.', err.detail || err.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /download  ->  MP3 / gorsel akis koprusu (CORS + yetki sorununu cozer)
+// ---------------------------------------------------------------------------
+//  Kullanim:
+//    GET /download?id=<clip_id>              -> feed'den gercek audio_url'yi bulur
+//    GET /download?url=https://cdn1...mp3    -> dogrudan allowlist'teki URL
+//    &inline=1                               -> tarayicida oynat (attachment yerine)
+//    &filename=midnight-808.mp3              -> dosya adini override et
+//
+//  Not: Istemci URL verirken SSRF korumasi devrede (bkz. isAllowedDownloadUrl).
+// ---------------------------------------------------------------------------
+app.get('/download', apiKeyGuard, async (req, res) => {
+  try {
+    const inline = req.query.inline === '1' || req.query.inline === 'true';
+    // mode=stream  ->  tarayicida oynat (inline) + gerekirse mp3'e cevir
+    const mode = req.query.mode === 'stream' ? 'stream' : 'download';
+    const wantTranscode = req.query.format === 'mp3' || req.query.format === 'wav' || mode === 'stream';
+    const format = req.query.format === 'wav' ? 'wav' : 'mp3';
+
+    let targetUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+    let suggestedName = typeof req.query.filename === 'string' ? req.query.filename.trim() : '';
+    let clipTitle = '';
+    let proxyMode = 'direct';      // direct | cdn | transparent
+    let forceTransparent = false;  // transparent kaynakta transcode yapilmaz
+    let handshakeSessionId = null; // handshake'ten gelen analytics session id
+    let requestedFormat = null;    // saglayicidan gelen sesin istenen formati
+
+    // --- (A) id verildiyse: feed'den gercek ses adresini coz ---
+    if (!targetUrl && req.query.id) {
+      const clipId = String(req.query.id).trim();
+      if (!/^[A-Za-z0-9_-]{8,64}$/.test(clipId)) {
+        return sendError(res, 400, 'INVALID_ID', 'Gecersiz klip id formati.');
+      }
+
+      const provider = activeProvider();
+
+      // Suno'ya ozgu handshake (varsa)
+      if (typeof provider.beforeStream === 'function') {
+        const hs = await provider.beforeStream(clipId);
+        if (hs) {
+          res.setHeader('X-Handshake', hs.result);
+          handshakeSessionId = hs.sessionId;
+        }
+      }
+
+      const track = await provider.getTrack(clipId);
+      if (!track) return sendError(res, 404, 'TRACK_NOT_FOUND', `Klip bulunamadi: ${clipId}`);
+
+      clipTitle = track.title || '';
+      requestedFormat = String(req.query.format || 'mp3').toLowerCase();
+
+      const source = await provider.getAudioSource(track);
+      if (!source) {
+        return sendError(
+          res,
+          409,
+          'NO_AUDIO_SOURCE',
+          'Saglayici bu klip icin ses adresi vermedi.',
+          track.download_blocked_reason || undefined,
+        );
+      }
+
+      // Ic kaynak: bellekten akit
+      if (source.internal || String(source.url).startsWith('internal://')) {
+        return await pipeInternalAudio(req, res, source.url);
+      }
+
+      targetUrl = source.url;
+      proxyMode = source.transparent ? 'transparent' : 'cdn';
+      if (source.transparent) forceTransparent = true;
+      if (!suggestedName) {
+        const slug = String(clipTitle || 'suno')
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '')
+          .slice(0, 48) || 'suno';
+        suggestedName = `${slug}-${clipId.slice(0, 8)}.${format}`;
+      }
+    }
+
+    if (!targetUrl) {
+      return sendError(res, 400, 'MISSING_TARGET', '?id=<clip_id> veya ?url=<https://...> gerekli.');
+    }
+
+    // --- (B) SSRF kontrolu ---
+    const check = isAllowedDownloadUrl(targetUrl);
+    if (!check.ok) {
+      log('warn', 'Indirme reddedildi (SSRF korumasi).', { url: String(targetUrl).slice(0, 80), reason: check.reason });
+      return sendError(res, 403, 'URL_NOT_ALLOWED', `Indirme adresi reddedildi: ${check.reason}`);
+    }
+
+    if (!suggestedName) suggestedName = `suno-${Date.now()}.${format}`;
+
+    const effectiveTranscode = forceTransparent ? false : wantTranscode;
+
+    log('info', 'Ses akisi baslatildi.', {
+      mode,
+      transcode: effectiveTranscode,
+      format,
+      proxyMode,
+    });
+
+    // --- (C) Ortak boru hatti: upstream -> [ffmpeg] -> res ---
+    await pipeAudioStream(req, res, {
+      upstreamUrl: check.url,
+      transcode: effectiveTranscode,
+      format,
+      filename: suggestedName,
+      inline: inline || mode === 'stream',
+      proxyMode,
+      sessionId: handshakeSessionId,
+    });
+  } catch (err) {
+    if (res.headersSent) {
+      log('warn', 'Indirme hatasi (basliklar gonderildikten sonra).', sanitizeMessage(err.message));
+      return res.destroy();
+    }
+    if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+      return sendError(res, 504, 'UPSTREAM_TIMEOUT', 'Dosya kaynagi zaman asimina ugradi.');
+    }
+    if (err.upstreamStatus) res.setHeader('X-Upstream-Status', String(err.upstreamStatus));
+    if (err.status && err.code) {
+      return sendError(res, err.status, err.code, err.message, err.detail);
+    }
+    return sendError(res, 500, 'DOWNLOAD_FAILED', 'Indirme basarisiz.', err.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /stream/:id  ->  tarayici dostu ses akisi (drop-in <audio src>)
+// ---------------------------------------------------------------------------
+//  Query:
+//    ?format=mp3|wav|original   (varsayilan mp3 - gerekirse ffmpeg ile donusturur)
+//    ?inline=1                  (varsayilan zaten inline)
+//
+//  Pro/Pro+ hesap:  CDN audio_url -> [ffmpeg] -> tarayici
+//  Ucretsiz hesap:  indirilebilir ses YOK -> 409 + aciklama (bkz. README §10)
+// ---------------------------------------------------------------------------
+app.get('/stream/:id', apiKeyGuard, async (req, res) => {
+  try {
+    const clipId = String(req.params.id || '').trim();
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(clipId)) {
+      return sendError(res, 400, 'INVALID_ID', 'Gecersiz klip id formati.');
+    }
+
+    const provider = activeProvider();
+    const providerName = providerRegistry.getProviderName();
+
+    // --- Suno'ya ozgu handshake (diger saglayicilarda no-op) ---
+    let handshakeSessionId = null;
+    if (typeof provider.beforeStream === 'function') {
+      const hs = await provider.beforeStream(clipId);
+      if (hs) {
+        res.setHeader('X-Handshake', hs.result);
+        handshakeSessionId = hs.sessionId;
+      }
+    }
+
+    const track = await provider.getTrack(clipId);
+    if (!track) return sendError(res, 404, 'TRACK_NOT_FOUND', `Klip bulunamadi: ${clipId}`);
+
+    if (!track.is_complete && !track.is_error) {
+      return sendError(
+        res,
+        425,
+        'TRACK_NOT_READY',
+        `Klip henuz hazir degil (durum: ${track.status}). /track/${clipId}?wait=true ile bekleyin.`,
+      );
+    }
+    if (track.is_error) {
+      return sendError(res, 409, 'TRACK_FAILED', `Uretim basarisiz (${providerName}).`, track.download_blocked_reason);
+    }
+
+    const source = await provider.getAudioSource(track);
+    if (!source) {
+      return sendError(
+        res,
+        409,
+        'NO_AUDIO_SOURCE',
+        `Saglayici (${providerName}) bu klip icin ses adresi vermedi.`,
+        track.download_blocked_reason || undefined,
+      );
+    }
+
+    // --- Ic kaynak (mock / elevenlabs): bellekten akit ---
+    if (source.internal || String(source.url).startsWith('internal://')) {
+      return await pipeInternalAudio(req, res, source.url);
+    }
+
+    // --- Dis kaynak: pass-through / transcode ---
+    const check = isAllowedDownloadUrl(source.url);
+    if (!check.ok) {
+      return sendError(res, 403, 'URL_NOT_ALLOWED', `Ses adresi reddedildi: ${check.reason}`);
+    }
+
+    const format = ['wav', 'original'].includes(String(req.query.format)) ? String(req.query.format) : 'mp3';
+    const fileName = `${slugifyText(track.title, 'beat')}-${clipId.slice(0, 8)}.${format === 'original' ? 'mp3' : format}`;
+
+    // Imza stratejisini istemciye raporla (deger sizdirmadan)
+    const signStrategy = (source.signature && source.signature.strategy) || 'none';
+    res.setHeader('X-Sign-Strategy', signStrategy);
+    if (source.signature && Object.keys(source.signature.params || {}).length) {
+      res.setHeader('X-Sign-Params', Object.keys(source.signature.params).join(','));
+    }
+
+    log('info', 'Stream istegi.', {
+      provider: providerName,
+      clipId,
+      format,
+      source: source.source,
+      sign: signStrategy,
+      signParams: source.signature ? Object.keys(source.signature.params || {}) : [],
+      url: signer.redactUrl(check.url),
+    });
+
+    await pipeAudioStream(req, res, {
+      upstreamUrl: check.url,
+      transcode: !source.transparent && format !== 'original',
+      format: format === 'original' ? 'mp3' : format,
+      filename: fileName,
+      inline: true,
+      proxyMode: source.transparent ? 'transparent' : 'cdn',
+      sessionId: handshakeSessionId,
+    });
+  } catch (err) {
+    if (res.headersSent) {
+      log('warn', 'Stream hatasi (basliklar sonrasi).', sanitizeMessage(err.message));
+      return res.destroy();
+    }
+    if (err.upstreamStatus) res.setHeader('X-Upstream-Status', String(err.upstreamStatus));
+    if (err.status && err.code) {
+      return sendError(res, err.status, err.code, err.message, err.detail);
+    }
+    return sendError(res, 502, 'STREAM_FAILED', 'Akis baslatilamadi.', err.detail || err.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /debug/stream/:id  ->  akis teshisi (bayt sayisi, status, header'lar)
+// ---------------------------------------------------------------------------
+//  Akisi istemciye GONDERMEZ; upstream'e baglanip ilk N bayti okur ve raporlar.
+//
+//  Query:
+//    ?bytes=16384   -> kac bayt okunacak (varsayilan 16384, max 1 MB)
+//    ?url=...       -> klip yerine dogrudan URL dene (allowlist gecerli)
+//    ?skipCookie=1  -> Cookie header'i gonderme (A/B testi icin)
+// ---------------------------------------------------------------------------
+app.get('/debug/stream/:id', apiKeyGuard, async (req, res) => {
+  const startedAt = Date.now();
+  try {
+    const clipId = String(req.params.id || '').trim();
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(clipId)) {
+      return sendError(res, 400, 'INVALID_ID', 'Gecersiz klip id formati.');
+    }
+
+    const maxBytes = Math.min(envInt(req.query.bytes, 16384), 1024 * 1024);
+
+    // --- Kaynak cozumu ---
+    const clip = await fetchClip(clipId);
+    if (!clip) return sendError(res, 404, 'TRACK_NOT_FOUND', `Klip bulunamadi: ${clipId}`);
+
+    const source = await resolveAudioSource(clip, req);
+    let targetUrl = source.url;
+    if (typeof req.query.url === 'string' && req.query.url.trim()) {
+      const direct = isAllowedDownloadUrl(req.query.url.trim());
+      if (!direct.ok) return sendError(res, 403, 'URL_NOT_ALLOWED', direct.reason);
+      targetUrl = direct.url;
+    }
+
+    // --- Header hazirla ---
+    const skipCookie = req.query.skipCookie === '1';
+    const tokenForCookie = authState.accessToken || CONFIG.sessionToken || null;
+    const cookieHeader = skipCookie ? null : buildUpstreamCookieHeader(tokenForCookie);
+
+    const headers = {
+      'User-Agent': CONFIG.upstreamUserAgent || BROWSER_UA,
+      Accept: '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      Referer: CONFIG.upstreamReferer,
+      Origin: CONFIG.upstreamOrigin,
+      'Browser-Token': buildBrowserToken(),
+      'Device-Id': resolveDeviceId(),
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-site',
+    };
+    if (cookieHeader) headers.Cookie = cookieHeader;
+    if (req.headers.range) headers.Range = req.headers.range;
+
+    // --- Upstream'i ac ve ilk N bayti oku ---
+    const upstream = await axios({
+      method: 'get',
+      url: targetUrl,
+      responseType: 'stream',
+      timeout: CONFIG.requestTimeoutMs,
+      maxRedirects: 3,
+      decompress: false,
+      validateStatus: () => true,
+      headers,
+      httpsAgent: getUpstreamAgent(),
+      proxy: false,
+    });
+
+    const chunks = [];
+    let bytesRead = 0;
+    let readError = null;
+
+    await new Promise((resolveProbe) => {
+      const finish = () => {
+        try {
+          upstream.data.destroy();
+        } catch (_e) {}
+        resolveProbe();
+      };
+
+      const timer = setTimeout(finish, 10000);
+
+      upstream.data.on('data', (chunk) => {
+        const room = maxBytes - bytesRead;
+        if (room <= 0) return;
+        chunks.push(chunk.length <= room ? chunk : chunk.subarray(0, room));
+        bytesRead += Math.min(chunk.length, room);
+        if (bytesRead >= maxBytes) {
+          clearTimeout(timer);
+          finish();
+        }
+      });
+      upstream.data.on('end', () => {
+        clearTimeout(timer);
+        finish();
+      });
+      upstream.data.on('error', (e) => {
+        readError = e.message;
+        clearTimeout(timer);
+        finish();
+      });
+    });
+
+    const body = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+    const firstBytes = body.subarray(0, 16);
+
+    // --- Sinyal yorumu ---
+    const ct = String(upstream.headers['content-type'] || '');
+    let signal = 'unknown';
+    if (bytesRead === 0) signal = 'EMPTY';
+    else if (firstBytes[0] === 0x49 && firstBytes[1] === 0x44 && firstBytes[2] === 0x33) signal = 'ID3/MP3';
+    else if (firstBytes[0] === 0xff && (firstBytes[1] & 0xe0) === 0xe0) signal = 'MPEG-frame/MP3';
+    else if (firstBytes[0] === 0x1a && firstBytes[1] === 0x45 && firstBytes[2] === 0xdf && firstBytes[3] === 0xa3)
+      signal = 'WebM/Matroska';
+    else signal = 'opaque (non-standard header)';
+
+    const report = {
+      ok: true,
+      clip_id: clipId,
+      source: source.source,
+      proxy_mode: source.transparent ? 'transparent' : 'cdn',
+      url: targetUrl,
+      elapsed_ms: Date.now() - startedAt,
+      request_headers_sent: {
+        ...Object.fromEntries(
+          Object.entries(headers).map(([k, v]) => [
+            k,
+            k.toLowerCase() === 'cookie'
+              ? v.split(';').map((c) => c.split('=')[0].trim())
+              : k.toLowerCase() === 'authorization'
+                ? '<redacted>'
+                : v,
+          ]),
+        ),
+      },
+      upstream: {
+        status: upstream.status,
+        status_text: upstream.statusText,
+        content_type: ct,
+        content_length: upstream.headers['content-length'] || null,
+        content_range: upstream.headers['content-range'] || null,
+        accept_ranges: upstream.headers['accept-ranges'] || null,
+        cache_control: upstream.headers['cache-control'] || null,
+        server: upstream.headers['server'] || null,
+        all_headers: upstream.headers,
+      },
+      body: {
+        bytes_read: bytesRead,
+        bytes_requested: maxBytes,
+        first_16_bytes_hex: firstBytes.toString('hex'),
+        first_16_bytes_ascii: firstBytes.toString('latin1').replace(/[^\x20-\x7e]/g, '.'),
+        detected_format: signal,
+        read_error: readError,
+      },
+      diagnosis:
+        bytesRead === 0
+          ? 'Upstream 200 dondurdu ama govde bos. Header/cookie gecisi mi yoksa sunucu tarafi mi, ' +
+            '?skipCookie=1 ile A/B testi yapin; ayrica ?bytes=65536 deneyin (gecikmeli yazim olabilir).'
+          : signal === 'opaque (non-standard header)'
+            ? 'Govde geliyor ancak MP3/WebM magic byte yok: kaynak standart bir ses dosyasi degil.'
+            : 'Govde geliyor ve gecerli bir ses konteyneri gibi gorunuyor.',
+    };
+
+    log('info', 'debug/stream raporu.', {
+      clipId,
+      upstreamStatus: upstream.status,
+      bytesRead,
+      signal,
+    });
+
+    res.setHeader('X-Upstream-Status', String(upstream.status));
+    res.setHeader('Cache-Control', 'no-store');
+    if (req.query.download === '1' && bytesRead > 0) {
+      // Teshis icin ilk N bayti dosya olarak indir
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename="probe-${clipId.slice(0, 8)}.bin"`);
+      return res.send(body);
+    }
+    return res.json(report);
+  } catch (err) {
+    log('error', 'debug/stream hatasi.', sanitizeMessage(err.message));
+    if (err.upstreamStatus) res.setHeader('X-Upstream-Status', String(err.upstreamStatus));
+    return sendError(res, 502, 'DEBUG_PROBE_FAILED', 'Teshis istegi basarisiz.', err.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /providers  ->  mevcut saglayicilar ve aktif olan
+// ---------------------------------------------------------------------------
+app.get('/providers', apiKeyGuard, async (_req, res) => {
+  const list = [];
+  for (const [name, mod] of Object.entries(providerRegistry.providers)) {
+    let configured = false;
+    try {
+      configured = await mod.isConfigured();
+    } catch (_e) {
+      configured = false;
+    }
+    list.push({ name, configured, active: name === providerRegistry.getProviderName() });
+  }
+  res.json({ ok: true, active: providerRegistry.getProviderName(), providers: list });
+});
+
+// ---------------------------------------------------------------------------
+// POST /providers/select  ->  { "provider": "mock" }  (runtime degistirme)
+// ---------------------------------------------------------------------------
+app.post('/providers/select', apiKeyGuard, async (req, res) => {
+  const requested = req.body && req.body.provider;
+  const selected = providerRegistry.setProviderName(requested);
+  if (!selected) {
+    return sendError(
+      res,
+      400,
+      'UNKNOWN_PROVIDER',
+      `Bilinmeyen saglayici: ${requested}`,
+      `Gecerli: ${providerRegistry.listProviders().join(', ')}`,
+    );
+  }
+  const mod = providerRegistry.getProvider();
+  const configured = await mod.isConfigured().catch(() => false);
+  log('info', 'Saglayici degistirildi.', { provider: selected, configured });
+  res.json({ ok: true, active: selected, configured });
+});
+
+
+// ---------------------------------------------------------------------------
+// GET /debug/signer  ->  imza motoru teshisi
+// ---------------------------------------------------------------------------
+//  NE YAPAR
+//    1. Imza stratejisini cozer (client -> pool -> derive -> none).
+//    2. Uretilen URL'i ve parametreleri (maskeli) gosterir.
+//    3. ?probe=1   -> URL'den gercekten bayt geliyor mu, OLCER.
+//    4. ?compare=1 -> hem IMZASIZ hem IMZALI URL'i olcup yan yana koyar.
+//                     (imza gercekten fark yaratiyor mu sorusunun kaniti)
+//
+//  Query:
+//    ?id=<clipId>        klip id (audiopipe sablonu icin)
+//    ?url=<https://...>  dogrudan URL (allowlist gecerli)
+//    ?spec=...           .env'deki SIGNER_SPEC'i gecici olarak ez (debug)
+//    ?secret=...         gecici secret (yanitta/logda GORUNMEZ)
+//    ?probe=1            bayt olcumu yap
+//    ?compare=1          imzasiz + imzali karsilastirma
+//    ?bytes=65536        probe okuma siniri (max 4 MB)
+//    ?put=1              cozulen parametreleri havuza yaz
+//    ?clear=1            havuzu bosalt
+// ---------------------------------------------------------------------------
+app.get('/debug/signer', apiKeyGuard, async (req, res) => {
+  const startedAt = Date.now();
+  try {
+    const clipId = String(req.query.id || req.query.clip_id || '').trim();
+    if (clipId && !/^[A-Za-z0-9_-]{8,64}$/.test(clipId)) {
+      return sendError(res, 400, 'INVALID_ID', 'Gecersiz klip id formati.');
+    }
+
+    const specOverride = typeof req.query.spec === 'string' && req.query.spec.trim() ? req.query.spec.trim() : '';
+    const secretOverride = typeof req.query.secret === 'string' && req.query.secret ? req.query.secret : undefined;
+
+    if (envBool(req.query.clear, false) && CONFIG.signerPoolEnabled) signaturePool.clear();
+
+    // --- Temel URL (parametresiz) ---
+    let baseUrl = null;
+    if (typeof req.query.url === 'string' && req.query.url.trim()) {
+      const direct = isAllowedDownloadUrl(req.query.url.trim());
+      if (!direct.ok) return sendError(res, 403, 'URL_NOT_ALLOWED', direct.reason);
+      baseUrl = direct.url;
+    } else if (clipId) {
+      baseUrl = fillUrlTemplate(CONFIG.audiopipeUrlTemplate, clipId, req);
+    } else {
+      return sendError(res, 400, 'MISSING_TARGET', 'En az bir ?id= veya ?url= gerekli.');
+    }
+
+    // --- Strateji cozumu ---
+    const resolution = await resolveSignature(clipId || 'debug', req, {
+      spec: specOverride || undefined,
+      secret: secretOverride,
+    });
+
+    const signedUrl = Object.keys(resolution.params).length
+      ? signer.buildSignedUrl(baseUrl, resolution.params)
+      : baseUrl;
+
+    if (envBool(req.query.put, false) && CONFIG.signerPoolEnabled && Object.keys(resolution.params).length) {
+      signaturePool.put(clipId || 'debug', resolution.params, {
+        source: 'debug',
+        ttlMs: envInt(req.query.ttl, CONFIG.signerPoolTtlMs),
+      });
+    }
+
+    // --- Olcum (opsiyonel) ---
+    const wantProbe = envBool(req.query.probe, false) || envBool(req.query.compare, false);
+    let probe = null;
+    let probeUnsigned = null;
+
+    if (wantProbe) {
+      const check = isAllowedDownloadUrl(signedUrl);
+      if (!check.ok) return sendError(res, 403, 'URL_NOT_ALLOWED', check.reason);
+
+      const probeOpts = { maxBytes: envInt(req.query.bytes, 65536), timeoutMs: envInt(req.query.timeout, 15000), req };
+      probe = await probeUpstreamBytes(check.url, probeOpts);
+
+      if (envBool(req.query.compare, false) && signedUrl !== baseUrl) {
+        const baseCheck = isAllowedDownloadUrl(baseUrl);
+        if (baseCheck.ok) probeUnsigned = await probeUpstreamBytes(baseCheck.url, probeOpts);
+      }
+    }
+
+    return res.json({
+      ok: true,
+      clip_id: clipId || null,
+      signer: signerStatus(),
+      derivers: Object.keys(signer.DERIVERS),
+      resolution: {
+        strategy: resolution.strategy,
+        from_pool: resolution.from_pool,
+        params_keys: Object.keys(resolution.params),
+        params_redacted: signer.redactParams(resolution.params),
+        errors: resolution.errors,
+        url: signer.redactUrl(signedUrl),
+        url_unsigned_redacted: signer.redactUrl(baseUrl),
+        changed: signedUrl !== baseUrl,
+      },
+      probe,
+      probe_unsigned: probeUnsigned,
+      comparison:
+        probe && probeUnsigned
+          ? {
+              signed_bytes: probe.bytes_read,
+              unsigned_bytes: probeUnsigned.bytes_read,
+              delta_bytes: probe.bytes_read - probeUnsigned.bytes_read,
+              verdict:
+                probe.bytes_read > probeUnsigned.bytes_read
+                  ? 'IMZA FARK YARATIYOR: imzali URL daha fazla bayt dondurdu.'
+                  : probe.bytes_read === probeUnsigned.bytes_read
+                    ? 'IMZA FARK YARATMIYOR: iki URL ayni miktarda bayt dondurdu.'
+                    : 'IMZA FARK YARATMIYOR (ters): imzasiz URL daha fazla bayt dondurdu.',
+            }
+          : null,
+      re_findings: signer.RE_FINDINGS,
+      elapsed_ms: Date.now() - startedAt,
+    });
+  } catch (err) {
+    if (err.status && err.code) return sendError(res, err.status, err.code, err.message, err.detail);
+    return sendError(res, 500, 'SIGNER_DEBUG_FAILED', 'Imza teshisi basarisiz.', err.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /debug/signer/pool   ->  havuza elle imza parametresi ekle
+// ---------------------------------------------------------------------------
+//  body: { clip_id: "...", params: { sig: "...", expires: "..." }, ttl_ms: 120000 }
+//  Tarayicidan yakalanan gercek bir imza buraya yazilir; proxy onu kullanir
+//  ve TTL boyunca yeniden uretmez.
+// ---------------------------------------------------------------------------
+app.post('/debug/signer/pool', apiKeyGuard, (req, res) => {
+  if (!CONFIG.signerEnabled || !CONFIG.signerPoolEnabled) {
+    return sendError(res, 503, 'SIGNER_DISABLED', 'Imza havuzu kapali (SIGNER_ENABLED / SIGNER_POOL_ENABLED).');
+  }
+  const body = req.body || {};
+  const clipId = String(body.clip_id || body.id || '').trim();
+  const params = body.params;
+
+  if (!clipId) return sendError(res, 400, 'INVALID_ID', 'clip_id zorunlu.');
+  if (!params || typeof params !== 'object' || Array.isArray(params)) {
+    return sendError(res, 400, 'INVALID_PARAMS', 'params nesnesi zorunlu.');
+  }
+  if (Object.keys(params).length > 12) {
+    return sendError(res, 400, 'TOO_MANY_PARAMS', 'En fazla 12 parametre.');
+  }
+
+  const clean = {};
+  for (const [k, v] of Object.entries(params)) {
+    if (!/^[A-Za-z0-9_-]{1,40}$/.test(k)) continue;
+    if (v === undefined || v === null) continue;
+    clean[k] = String(v).slice(0, 2048);
+  }
+  if (!Object.keys(clean).length) {
+    return sendError(res, 400, 'INVALID_PARAMS', 'Gecerli parametre yok.');
+  }
+
+  signaturePool.put(clipId, clean, { source: 'api', ttlMs: envInt(body.ttl_ms, CONFIG.signerPoolTtlMs) });
+  return res.json({
+    ok: true,
+    clip_id: clipId,
+    params_keys: Object.keys(clean),
+    ttl_ms: envInt(body.ttl_ms, CONFIG.signerPoolTtlMs),
+    pool: signaturePool.stats_(),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /debug/signer/pool[?key=...]   ->  havuzdan kayit sil / temizle
+// ---------------------------------------------------------------------------
+app.delete('/debug/signer/pool', apiKeyGuard, (req, res) => {
+  const key = String(req.query.key || '').trim();
+  if (key) {
+    const removed = signaturePool.delete(key);
+    return res.json({ ok: true, removed, key });
+  }
+  signaturePool.clear();
+  return res.json({ ok: true, cleared: true });
+});
+
+// ---------------------------------------------------------------------------
+// GET /debug/tls  ->  upstream TLS parmak izini olcer (JA3/JA4 + cipher)
+// ---------------------------------------------------------------------------
+//  Query:
+//    ?url=https://tls.peet.ws/api/all   (varsayilan) - parmak izi servisi
+//    ?profile=none                      - Chrome profili kapali (A/B testi)
+// ---------------------------------------------------------------------------
+app.get('/debug/tls', apiKeyGuard, async (req, res) => {
+  try {
+    const target = typeof req.query.url === 'string' && req.query.url.trim()
+      ? req.query.url.trim()
+      : 'https://tls.peet.ws/api/all';
+    const check = isAllowedDownloadUrl(target);
+    if (!check.ok) return sendError(res, 403, 'URL_NOT_ALLOWED', check.reason);
+
+    const useChrome = req.query.profile !== 'none';
+    const agent = useChrome ? getUpstreamAgent() : undefined;
+
+    const startedAt = Date.now();
+    const r = await axios.get(check.url, {
+      timeout: 20000,
+      httpsAgent: agent,
+      proxy: false,
+      headers: { 'User-Agent': CONFIG.upstreamUserAgent || BROWSER_UA, Accept: '*/*' },
+      validateStatus: () => true,
+    });
+
+    const d = r.data || {};
+    return res.json({
+      ok: true,
+      profile: useChrome ? 'chrome-like' : 'node-default',
+      elapsed_ms: Date.now() - startedAt,
+      tls: {
+        version: d.tls && d.tls.tls_version_negotiated,
+        ja3_hash: d.tls && d.tls.ja3_hash,
+        ja3: d.tls && d.tls.ja3,
+        ja4: d.tls && d.tls.ja4,
+        cipher_suite: d.tls && d.tls.cipher_suite,
+        alpn: d.tls && d.tls.alpn_protocol,
+        extensions: d.tls && d.tls.extensions,
+      },
+      http2: d.http2 ? { akamai_fingerprint: d.http2.akamai_fingerprint } : null,
+      note:
+        'Node, TLS uzanti sirasini ve GREASE degerlerini kontrol edemez; ' +
+        'bu yuzden chrome-like profil JA3 hashini Chrome ile birebir esitlemez.',
+    });
+  } catch (err) {
+    return sendError(res, 502, 'TLS_PROBE_FAILED', 'TLS olcumu basarisiz.', err.message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// WEB DASHBOARD  (public/ -> http://host/)
+// ---------------------------------------------------------------------------
+//  Statik dosyalar API rotalarindan SONRA mount edilir; boylece /stream gibi
+//  yollar golgelenmez. Onbellek: 1 saat (kucuk tek sayfa).
+// ---------------------------------------------------------------------------
+app.use(
+  express.static(CONFIG.publicDir, {
+    index: 'index.html',
+    maxAge: '1h',
+    etag: true,
+    fallthrough: true,
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// 404 + global hata yakalayici
+// ---------------------------------------------------------------------------
+app.use((req, res) => sendError(res, 404, 'NOT_FOUND', `${req.method} ${req.path} bulunamadi.`));
+
+// eslint-disable-next-line no-unused-vars
+app.use((err, _req, res, _next) => {
+  log('error', 'Express hata yakalayici.', err && err.message);
+  if (err && err.type === 'entity.parse.failed') {
+    return sendError(res, 400, 'INVALID_JSON', 'Gecersiz JSON govdesi.');
+  }
+  return sendError(res, 500, 'INTERNAL_ERROR', 'Sunucu hatasi.');
+});
+
+// ============================================================================
+// 6. ARKA PLAN GOREVI (KEEP-ALIVE) + BASLATMA
+// ============================================================================
+
+let keepAliveTimer = null;
+
+/**
+ * Oturumu sicak tutan dongu:
+ *   1) Clerk oturumuna "touch" at,
+ *   2) access token'i zorla yenile.
+ * Hata olsa bile dongu devam eder (Render uykuya dalsa da servis ayaga kalkar).
+ */
+async function keepAliveTick() {
+  if (!CONFIG.refreshToken) {
+    log('warn', 'Keep-alive atlandi: SUNO_REFRESH_TOKEN yok.');
+    return;
+  }
+  try {
+    if (authState.sessionId) await touchSession(authState.sessionId);
+    await refreshAccessToken(true);
+  } catch (err) {
+    // Ust uste basarisizliklarda sesli uyar; kisa hatalarda debug seviyesinde kal.
+    log('error', 'Keep-alive turu basarisiz.', sanitizeMessage(err.message));
+  }
+}
+
+function startKeepAlive() {
+  if (keepAliveTimer) return;
+
+  // Acilista bir kez calistir (ilk token'i hemen al), ardindan periyodik devam et.
+  keepAliveTick();
+
+  keepAliveTimer = setInterval(keepAliveTick, CONFIG.keepAliveIntervalMs);
+  // Node'un bu timer yuzunden kapanmasini engelleme: unref() ile event loop'u serbest birak.
+  if (typeof keepAliveTimer.unref === 'function') keepAliveTimer.unref();
+
+  log('info', `Keep-alive baslatildi: her ${Math.round(CONFIG.keepAliveIntervalMs / 60000)} dakikada bir.`);
+}
+
+// Render "PORT" env'ini zorunlu tutar -> 0.0.0.0 dinlenmeli.
+const server = app.listen(CONFIG.port, '0.0.0.0', () => {
+  log('info', `Suno Beat Proxy dinleniyor: http://0.0.0.0:${CONFIG.port}`);
+  log('info', `Suno API: ${CONFIG.sunoApiBase}${CONFIG.generatePath}`);
+  log('info', `Clerk: ${CONFIG.clerkBaseUrl} (js v${CONFIG.clerkJsVersion})`);
+  if (!CONFIG.allowedApiKeys.length) {
+    log('warn', 'ALLOWED_API_KEYS bos -> API korumasi KAPALI. Production icin doldurun.');
+  } else {
+    log('info', 'API anahtari korumasi aktif.', { keys: CONFIG.allowedApiKeys.length });
+  }
+  startKeepAlive();
+});
+
+// ---- Graceful shutdown (Render deploy/restart) ----
+function shutdown(signal) {
+  log('info', `${signal} alindi, kapatiliyor...`);
+  if (keepAliveTimer) clearInterval(keepAliveTimer);
+  server.close(() => process.exit(0));
+  // 8 sn icinde kapanmazsa zorla cik.
+  setTimeout(() => process.exit(0), 8000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+// Beklenmeyen hatalarda process'in sessizce olmesini engelle.
+process.on('unhandledRejection', (reason) => {
+  log('error', 'unhandledRejection', sanitizeMessage(reason && reason.message ? reason.message : reason));
+});
+process.on('uncaughtException', (err) => {
+  log('error', 'uncaughtException', sanitizeMessage(err && err.message));
+});
+
+module.exports = { app, server };
