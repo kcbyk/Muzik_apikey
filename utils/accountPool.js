@@ -104,15 +104,21 @@ class SunoAccount {
   }
 
   isAvailable() {
-    if (!this.isExhausted) return true;
-    // Sure dolduysa otomatik sifirla
-    if (Date.now() >= this.exhaustedUntil) {
-      this.isExhausted = false;
-      this.exhaustedReason = null;
-      this.exhaustedUntil = 0;
-      return true;
+    if (this.isExhausted) {
+      // Sure dolduysa otomatik sifirla
+      if (Date.now() >= this.exhaustedUntil) {
+        this.isExhausted = false;
+        this.exhaustedReason = null;
+        this.exhaustedUntil = 0;
+      } else {
+        return false;
+      }
     }
-    return false;
+    // Oturumu tamamen olu (cikis yapilmis) hesaplar sirayi tikamasin
+    if (this.lastError && /clerk oturumu bulunamadi/i.test(this.lastError) && !this.sessionId) {
+      return false;
+    }
+    return true;
   }
 
   markExhausted(reason = 'Kredi tukendi', durationMs = null) {

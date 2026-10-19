@@ -112,10 +112,10 @@ const CONFIG = {
   refreshBeforeExpiryMs: envInt(process.env.REFRESH_BEFORE_EXPIRY_MS, 5 * 60 * 1000),
 
   // --- Uretim varsayilanlari ---
-  // Ucretsiz plan yalnizca chirp-v3-5'i kabul ediyor (digerleri 403 permission_denied).
-  defaultModel: process.env.DEFAULT_MODEL || 'chirp-v3-5',
+  // Suno ucretsiz planda guncel varsayilan model: chirp-goose (v6-mini)
+  defaultModel: process.env.DEFAULT_MODEL || 'chirp-goose',
   // Model yetkisi yoksa sirayla denenecek modeller.
-  modelFallback: (process.env.MODEL_FALLBACK || 'chirp-v3-5,chirp-v4-5,chirp-v4').split(',').map((m) => m.trim()).filter(Boolean),
+  modelFallback: (process.env.MODEL_FALLBACK || 'chirp-goose,chirp-v3-5').split(',').map((m) => m.trim()).filter(Boolean),
   defaultInstrumental: envBool(process.env.DEFAULT_INSTRUMENTAL, true),
 
   // --- Ag ---

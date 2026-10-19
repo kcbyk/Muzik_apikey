@@ -60,20 +60,41 @@ module.exports = {
           break;
         } catch (err) {
           const isExhausted = ctx.isCreditExhaustedError && ctx.isCreditExhaustedError(err);
-          const isAuthFailed =
+          const isDeadSession = /clerk oturumu bulunamadi/i.test(String(err.message || err.detail || ''));
+          const isTokenRejected =
             err.status === 401 ||
             err.status === 422 ||
             err.isAuthError ||
             err.code === 'AUTH_ERROR' ||
             err.code === 'SESSION_EXPIRED' ||
-            /clerk oturumu bulunamadi|token reddi|token_validation_failed/i.test(
+            /token reddi|token_validation_failed|verify your request/i.test(
               String(err.message || err.detail || '')
             );
 
-          if (isExhausted || isAuthFailed) {
-            creditExhausted = true;
+          if (isExhausted) {
             lastError = err;
+            if (pool && account) {
+              pool.markAccountExhausted(account, err.detail || err.message || 'Kredi tukendi');
+            }
             break; // Bu hesabi atla, siradaki hesaba gec
+          }
+
+          if (isDeadSession) {
+            lastError = err;
+            if (account) {
+              account.lastError = 'Clerk oturumu bulunamadi; suno.com uzerinden yeni cookie alin.';
+              account.sessionId = null;
+            }
+            break; // Siradaki hesaba gec
+          }
+
+          if (isTokenRejected) {
+            lastError = err;
+            if (pool && account) {
+              // 60 saniyelik kisa mola ver, 24 saat kitleme
+              pool.markAccountExhausted(account, err.detail || err.message || 'Token dogrulama reddi', 60000);
+            }
+            break; // Siradaki hesaba gec
           }
 
           const denied =
@@ -90,26 +111,34 @@ module.exports = {
         }
       }
 
-      if (creditExhausted) {
-        if (pool && account) {
-          pool.markAccountExhausted(account, lastError.detail || lastError.message || 'Kredi tukendi');
-          const remaining = pool.getAvailableAccounts().length;
-          if (ctx.log) {
-            ctx.log(
-              'warn',
-              `[AccountPool] ${account.id} hesabi limit/kredi tukendi. Kalan aktif hesap: ${remaining}. Sonraki hesaba devrediliyor...`
-            );
-          }
-          if (remaining > 0) {
-            continue; // Siradaki hesaba gec ve tekrar dene
-          }
+      if (lastError && (!response || (!response.clips && !response.data && !Array.isArray(response)))) {
+        const remaining = pool ? pool.getAvailableAccounts().length : 0;
+        if (ctx.log) {
+          ctx.log(
+            'warn',
+            `[AccountPool] ${account ? account.id : 'hesap'} uretim basarisiz. Kalan aktif hesap: ${remaining}.`
+          );
         }
-        throw new ProviderError(
-          402,
-          'ALL_ACCOUNTS_EXHAUSTED',
-          'Havuzdaki tum Suno hesaplarinin gunluk limitleri tukendi.',
-          lastError ? (lastError.detail || lastError.message) : undefined
-        );
+        if (remaining > 0) {
+          continue; // Siradaki hesaba gec ve tekrar dene
+        }
+
+        const isExhausted = ctx.isCreditExhaustedError && ctx.isCreditExhaustedError(lastError);
+        if (isExhausted) {
+          throw new ProviderError(
+            402,
+            'ALL_ACCOUNTS_EXHAUSTED',
+            'Havuzdaki tum Suno hesaplarinin gunluk limitleri tukendi.',
+            lastError.detail || lastError.message
+          );
+        } else {
+          throw new ProviderError(
+            lastError.status || 422,
+            lastError.code || 'TOKEN_VALIDATION_FAILED',
+            `Suno oturum/token dogrulamasi basarisiz: ${lastError.detail || lastError.message || 'Lutfen suno.com uzerinde oturumunuzu acin.'}`,
+            lastError.detail || lastError.message
+          );
+        }
       }
 
       const clips = Array.isArray(response)
