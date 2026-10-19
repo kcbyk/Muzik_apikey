@@ -1050,6 +1050,10 @@ Tek dosya, **harici bağımlılık yok** (CDN/font/script yok — 19 KB, inline 
 
 ### 19.3 Render dağıtımı
 
+**Canlı servis:** https://muzik-apikey.onrender.com
+(`ALLOWED_API_KEYS` panelden tanımlı; anahtarı Render > Environment bölümünden
+görüp değiştirebilirsin. Ücretsiz planda 15 dk hareketsizlikte uykuya geçer.)
+
 `render.yaml` blueprint olarak hazır: `plan: free`, `region: frankfurt`,
 `buildCommand: npm install --omit=dev`, `startCommand: npm start`,
 `healthCheckPath: /ping`, `autoDeploy: true`, `NODE_OPTIONS=--max-old-space-size=384`.
