@@ -1713,3 +1713,61 @@ console.log('🎧 hazır — şimdi şu prompt ile müzik üret:',PROMPT);
 
 Sunucuya düşen şablon `GET /auth/gemini-template` ile görülebilir; provider
 onu otomatik kullanır (`runtimeTemplate`), redeploy gerekmez.
+
+---
+
+## 31. 💳 `reapi` sağlayıcısı — gerçek dosya, kalıcı URL, token derdi yok
+
+### 31.1 Neden
+
+reapi.ai, Suno V6'yı **kendi altyapısıyla** sunan bir gateway. Biten sesi kendi
+deposunda barındırıyor ("Finished audio is rehosted on reAPI storage, so the URLs
+keep working"), yani çıktı **indirilebilir gerçek bir dosya**. Suno free plandaki
+`is_download_unlocked: false` sorunu burada yok.
+
+### 31.2 Kurulum
+
+```env
+AUDIO_PROVIDER=reapi
+REAPI_API_KEY=...                 # https://reapi.ai/settings/apikeys
+REAPI_VERSION=V6                  # V6 | V6_MINI | V6_WILD
+REAPI_MODEL=suno-music
+REAPI_INSTRUMENTAL=true
+REAPI_MAX_CLIPS=3
+REAPI_TTL_MINUTES=45
+```
+
+### 31.3 Akış
+
+```text
+POST /generate-beat
+  → POST {BASE}/api/v1/audio/generations  { model, version, prompt, instrumental }
+  → { id: taskId }                       (asenkron)
+  → clip_ids: ["<taskId>__0", "<taskId>__1"]   (istek başına 2 track)
+
+GET /track/:id
+  → GET {BASE}/api/v1/tasks/<taskId>
+  → status → complete | generating | queued | error
+  → track.audio_url (reapi deposunda, kalıcı)
+
+GET /download?id=…
+  → ses baytları çekilir, bellekte tutulur
+  → 200 audio/mpeg  (X-Download-Mode: memory), Range destekli
+```
+
+### 31.4 Maliyet
+
+| Kalem | Tutar |
+|---|---|
+| 1 kredi | $0.001 |
+| 1 üretim (2 track) | **66 kredi ≈ $0.066** → track başına ~$0.033 |
+| $1 | 1000 kredi ≈ **15 üretim / 30 track** |
+
+Başarısız görevler otomatik iade.
+
+### 31.5 Ölçüm
+
+| Test | Sonuç |
+|---|---|
+| `POST /generate-beat` (geçersiz anahtar) | `REAPI_ERROR` + `"Invalid API key."` — uç ve şema doğru |
+| Sağlayıcı kaydı | ✅ `['suno','replicate','google','gemini-web','reapi','elevenlabs','mock']` |
