@@ -69,13 +69,21 @@ class SunoAccount {
     this.refreshCount = 0;
     this.lastError = null;
     this.inFlight = null;
+    this.tokenType = 'refresh';
+    this.email = null;
+    this.handle = null;
 
     // Eger verilen token bir JWT ise (__session veya hazir token)
     const payload = decodeJwtPayload(this.refreshToken);
     if (payload) {
+      this.tokenType = payload['suno.com/claims/token_type'] || 'refresh';
+      this.email = payload['suno.com/claims/email'] || payload['https://suno.ai/claims/email'] || null;
+      this.handle = payload['suno/handle'] || null;
       if (payload.sid) this.sessionId = payload.sid;
       if (payload.exp) {
         this.expiresAt = payload.exp * 1000;
+      }
+      if (this.tokenType === 'access') {
         this.accessToken = this.refreshToken;
       }
     }
@@ -89,6 +97,9 @@ class SunoAccount {
   }
 
   buildCookieHeader() {
+    if (this.tokenType === 'access') {
+      return `__session=${this.accessToken || this.refreshToken}`;
+    }
     return `__client=${this.refreshToken}`;
   }
 
@@ -212,6 +223,12 @@ class SunoAccount {
     const stillValid = this.accessToken && (this.expiresAt === 0 || this.expiresAt - refreshBeforeExpiryMs > now);
     if (!force && stillValid) return this.accessToken;
 
+    if (this.tokenType === 'access') {
+      if (this.accessToken && (this.expiresAt === 0 || this.expiresAt > now)) {
+        return this.accessToken;
+      }
+    }
+
     if (this.inFlight) return this.inFlight;
 
     this.inFlight = (async () => {
@@ -282,6 +299,9 @@ class SunoAccount {
     return {
       id: this.id,
       index: this.index,
+      email: this.email || null,
+      handle: this.handle || null,
+      tokenType: this.tokenType,
       isAvailable: this.isAvailable(),
       isExhausted: this.isExhausted,
       exhaustedReason: this.exhaustedReason,
@@ -445,12 +465,12 @@ function parseTokensFromEnv(env = process.env) {
   // 2) SUNO_REFRESH_TOKEN_1 .. SUNO_REFRESH_TOKEN_20
   for (let i = 1; i <= 20; i++) {
     const key = `SUNO_REFRESH_TOKEN_${i}`;
-    if (env[key]) tokens.push(env[key]);
+    if (env[key]) tokens.push(...String(env[key]).trim().split(/[\r\n,]+/));
   }
 
-  // 3) SUNO_REFRESH_TOKEN (tekli fallback)
+  // 3) SUNO_REFRESH_TOKEN (tekli veya coklu fallback)
   if (env.SUNO_REFRESH_TOKEN) {
-    tokens.push(env.SUNO_REFRESH_TOKEN);
+    tokens.push(...String(env.SUNO_REFRESH_TOKEN).trim().split(/[\r\n,]+/));
   }
 
   // Temizle ve tekillestir
