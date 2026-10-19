@@ -17,14 +17,36 @@ cp .env.example .env     # .env'i doldurun
 npm start
 ```
 
-### `SUNO_REFRESH_TOKEN` nasıl alınır?
+### `SUNO_REFRESH_TOKEN` ve Çoklu Hesap Havuzu (Multi-Account Pool)
 
-1. Tarayıcıda <https://suno.com> adresine giriş yapın.
+Suno ücretsiz hesaplarında günlük 50 kredi (5 şarkı / 10 klip) limiti bulunur. Tek bir hesabın kredisi bittiğinde sistemin **hiç durmadan kesintisiz devam etmesi** için birden fazla hesabı havuzda toplayabilirsiniz.
+
+#### 1. Token'ları Alma
+1. Tarayıcıda (farklı profiller veya gizli sekmelerden) her bir Suno hesabınıza giriş yapın.
 2. `F12` → **Application** → **Cookies** → `https://suno.com`
-3. **`__client`** cookie'sinin değerini kopyalayın (uzun JWT, ~1 yıl geçerli).
-4. `.env` içindeki `SUNO_REFRESH_TOKEN=` satırına yapıştırın.
+3. Her hesabın **`__client`** cookie değerini kopyalayın.
 
-> Tüm `Cookie:` header'ını yapıştırırsanız da olur — kod `__client=...` kısmını otomatik ayıklar.
+#### 2. Tanımlama Yöntemleri (Render veya `.env`)
+İstediğiniz yöntemi kullanabilirsiniz:
+* **Yöntem 1 (Önerilen - Virgülle):**
+  ```env
+  SUNO_REFRESH_TOKENS=token1,token2,token3,token4,token5
+  ```
+* **Yöntem 2 (Ayrı ayrı satırlarda):**
+  ```env
+  SUNO_REFRESH_TOKEN_1=token1
+  SUNO_REFRESH_TOKEN_2=token2
+  SUNO_REFRESH_TOKEN_3=token3
+  ```
+* **Yöntem 3 (Klasik tek hesap):**
+  ```env
+  SUNO_REFRESH_TOKEN=token1
+  ```
+
+#### 3. Havuz Nasıl Çalışır?
+- **Otomatik Devir (Auto-Rollover):** Hesap 1'in kredisi bittiğinde (HTTP 402 / out of credits), arka plan bunu otomatik algılar, Hesap 1'i işaretler ve **istemciye hiçbir hata hissettirmeden** aynı isteği hemen Hesap 2 ile üretir!
+- **Otomatik Sıfırlanma:** Suno'nun günlük kredileri her gece 00:00 UTC'de yenilenir. Sistem de 00:05 UTC'de tükenmiş tüm hesapları otomatik olarak tekrar aktif havuzuna dahil eder.
+- **Canlı Tutma (Keep-Alive):** Havuzdaki tüm hesaplar her 15 dakikada bir otomatik touch ve token yenilemesiyle 7/24 uyanık ve sıcak tutulur.
 
 ---
 

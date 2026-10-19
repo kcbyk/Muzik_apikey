@@ -37,39 +37,88 @@ module.exports = {
       ...(extra && typeof extra === 'object' ? extra : {}),
     };
 
-    // Model yetkisi yoksa fallback zinciri (ucretsiz plan yalnizca chirp-v3-5)
-    const models = [payload.mv, ...ctx.modelFallback.filter((m) => m !== payload.mv)];
-    let response;
-    const tried = [];
+    const pool = ctx.accountPool;
+    const initialPoolSize = pool && pool.size() > 0 ? pool.getAvailableAccounts().length : 1;
+    const maxAttempts = Math.max(1, initialPoolSize);
+    let lastError = null;
 
-    for (const mv of models) {
-      payload.mv = mv;
-      tried.push(mv);
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        response = await ctx.sunoRequest('post', ctx.generatePath, payload);
-        break;
-      } catch (err) {
-        const denied =
-          err.status === 403 && /access to this model|permission_denied/i.test(String(err.detail || ''));
-        if (!denied) throw err;
-        if (mv === models[models.length - 1]) {
-          throw new ProviderError(
-            403,
-            'MODEL_NOT_AVAILABLE',
-            'Bu hesapta kullanilabilir model bulunamadi.',
-            `${tried.join(', ')} -> permission_denied`,
-          );
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const account = pool && pool.size() > 0 ? pool.getActiveAccount() : null;
+
+      // Model yetkisi yoksa fallback zinciri (ucretsiz plan yalnizca chirp-v3-5)
+      const models = [payload.mv, ...ctx.modelFallback.filter((m) => m !== payload.mv)];
+      let response;
+      const tried = [];
+      let creditExhausted = false;
+
+      for (const mv of models) {
+        payload.mv = mv;
+        tried.push(mv);
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          response = await ctx.sunoRequest('post', ctx.generatePath, payload, { account });
+          break;
+        } catch (err) {
+          if (ctx.isCreditExhaustedError && ctx.isCreditExhaustedError(err)) {
+            creditExhausted = true;
+            lastError = err;
+            break; // Model fallback'e devam etme, cunku bu hesabin kredisi bitti
+          }
+
+          const denied =
+            err.status === 403 && /access to this model|permission_denied/i.test(String(err.detail || ''));
+          if (!denied) throw err;
+          if (mv === models[models.length - 1]) {
+            throw new ProviderError(
+              403,
+              'MODEL_NOT_AVAILABLE',
+              'Bu hesapta kullanilabilir model bulunamadi.',
+              `${tried.join(', ')} -> permission_denied`,
+            );
+          }
         }
       }
+
+      if (creditExhausted) {
+        if (pool && account) {
+          pool.markAccountExhausted(account, lastError.detail || lastError.message || 'Kredi tukendi');
+          const remaining = pool.getAvailableAccounts().length;
+          if (ctx.log) {
+            ctx.log(
+              'warn',
+              `[AccountPool] ${account.id} hesabi limit/kredi tukendi. Kalan aktif hesap: ${remaining}. Sonraki hesaba devrediliyor...`
+            );
+          }
+          if (remaining > 0) {
+            continue; // Siradaki hesaba gec ve tekrar dene
+          }
+        }
+        throw new ProviderError(
+          402,
+          'ALL_ACCOUNTS_EXHAUSTED',
+          'Havuzdaki tum Suno hesaplarinin gunluk limitleri tukendi.',
+          lastError ? (lastError.detail || lastError.message) : undefined
+        );
+      }
+
+      const clips = Array.isArray(response)
+        ? response
+        : (response && (response.clips || response.data)) || [];
+      const clipIds = clips.map((c) => c && (c.id || c.clip_id)).filter(Boolean);
+
+      if (pool && account) {
+        account.totalGenerated += 1;
+        clips.forEach((c) => {
+          const id = c && (c.id || c.clip_id);
+          if (id) pool.recordClipAccount(id, account.id);
+        });
+      }
+
+      return { clip_ids: clipIds, clips: clips.map((c) => ctx.normalizeClip(c)).filter(Boolean), raw: response };
     }
 
-    const clips = Array.isArray(response)
-      ? response
-      : (response && (response.clips || response.data)) || [];
-    const clipIds = clips.map((c) => c && (c.id || c.clip_id)).filter(Boolean);
-
-    return { clip_ids: clipIds, clips: clips.map((c) => ctx.normalizeClip(c)).filter(Boolean), raw: response };
+    if (lastError) throw lastError;
+    throw new ProviderError(500, 'GENERATE_FAILED', 'Uretim yapilamadi.');
   },
 
   async getTrack(clipId) {

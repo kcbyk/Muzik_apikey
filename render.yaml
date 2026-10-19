@@ -41,9 +41,16 @@ services:
       - key: KEY_STORE_FILE
         value: /tmp/keys.json
 
-      # --- Sir olarak panelden girilecek (sync: false) ---
+      # --- Coklu Hesap Havuzu (Suno Multi-Account Pool) ---
+      # Tekli hesap: SUNO_REFRESH_TOKEN
+      # Coklu hesap: SUNO_REFRESH_TOKENS (virgulle ayrilmis token listesi)
+      # veya SUNO_REFRESH_TOKEN_1, SUNO_REFRESH_TOKEN_2...
+      - key: SUNO_REFRESH_TOKENS
+        sync: false
       - key: SUNO_REFRESH_TOKEN
         sync: false
+      - key: ACCOUNT_ROTATION_STRATEGY
+        value: fallback
       # x-api-key / ?api_key= ile eslesecek anahtar listesi
       - key: ALLOWED_API_KEYS
         sync: false

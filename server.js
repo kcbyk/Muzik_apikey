@@ -40,6 +40,7 @@ const signer = require('./utils/signer');
 const { SignerPool } = require('./utils/signerPool');
 const { KeyStore } = require('./utils/keyStore');
 const mangoDecrypter = require('./utils/mangoDecrypter');
+const { AccountPool, parseTokensFromEnv, isCreditExhaustedError } = require('./utils/accountPool');
 
 // ============================================================================
 // 1. KONFIGURASYON
@@ -211,6 +212,16 @@ const CONFIG = {
 
   logLevel: (process.env.LOG_LEVEL || 'info').toLowerCase(),
 };
+
+// Coklu Suno / Clerk hesap havuzu (Account Pool)
+const configuredTokens = parseTokensFromEnv(process.env);
+const accountPool = new AccountPool(
+  configuredTokens,
+  process.env.ACCOUNT_ROTATION_STRATEGY || 'fallback'
+);
+if (!CONFIG.refreshToken && accountPool.getActiveAccount()) {
+  CONFIG.refreshToken = accountPool.getActiveAccount().refreshToken;
+}
 
 // Taklit edilecek tarayici kimligi. Suno bot korumasi (Cloudflare) User-Agent
 // tutarliligi bekledigi icin tek bir sabit UA kullaniyoruz.
@@ -1860,8 +1871,8 @@ function sendError(res, status, code, message, detail) {
 //
 // ============================================================================
 
-/** Bellekteki oturum durumu (process basina tek). */
-const authState = {
+/** Bellekteki oturum durumu (tekli token fallback ve uyumluluk). */
+const fallbackAuthState = {
   accessToken: null,   // gecerli Bearer JWT
   expiresAt: 0,        // JWT exp (ms) - 0 ise bilinmiyor
   sessionId: null,     // Clerk session id
@@ -1872,23 +1883,46 @@ const authState = {
 };
 
 /**
- * .env'den gelen degeri Cookie header formatina cevirir.
- * Kullanici ister sadece degeri, ister "Cookie: a=b; __client=xyz" seklinde
- * tum header'i yapistirmis olabilir; iki durumu da destekliyoruz.
+ * authState proxy'si: kod tabanindaki tum authState okuma/yazmalari
+ * otomatik olarak o anda aktif olan hesaba yonlendirilir.
  */
-function buildCookieHeader() {
+const authState = new Proxy(fallbackAuthState, {
+  get(target, prop) {
+    const act = accountPool.getActiveAccount();
+    if (act && prop in act) {
+      return act[prop];
+    }
+    return target[prop];
+  },
+  set(target, prop, value) {
+    const act = accountPool.getActiveAccount();
+    if (act && prop in act) {
+      act[prop] = value;
+    }
+    target[prop] = value;
+    return true;
+  },
+});
+
+/**
+ * Cookie header formatina cevirir. Belirtilen hesap varsa onun cerezini,
+ * yoksa o anki aktif hesabi veya CONFIG.refreshToken'i kullanir.
+ */
+function buildCookieHeader(account = null) {
+  const act = account || accountPool.getActiveAccount();
+  if (act) return act.buildCookieHeader();
   const raw = CONFIG.refreshToken;
   if (!raw) return '';
   if (raw.includes('__client=')) {
-    // Icinden __client=... kisimini ayikla.
     const match = raw.match(/__client=([^;]+)/);
     return match ? `__client=${match[1].trim()}` : raw;
   }
   return `__client=${raw}`;
 }
 
-function requireRefreshToken() {
-  if (!CONFIG.refreshToken) {
+function requireRefreshToken(account = null) {
+  const act = account || accountPool.getActiveAccount();
+  if (!act && !CONFIG.refreshToken) {
     throw new Error(
       'SUNO_REFRESH_TOKEN tanimli degil. suno.com -> F12 -> Application -> Cookies -> __client degerini .env dosyasina ekleyin.',
     );
@@ -1897,9 +1931,19 @@ function requireRefreshToken() {
 
 /**
  * (A) Clerk client bilgisini cek: session id + son aktif token.
- * sessionId zaten biliniyorsa yalnizca gerektiginde cagrilir.
  */
-async function fetchClerkClient() {
+async function fetchClerkClient(account = null) {
+  const act = account || accountPool.getActiveAccount();
+  if (act) {
+    return act.fetchClerkClient({
+      clerkBaseUrl: CONFIG.clerkBaseUrl,
+      clerkJsVersion: CONFIG.clerkJsVersion,
+      requestTimeoutMs: CONFIG.requestTimeoutMs,
+      userAgent: BROWSER_UA,
+      log,
+    });
+  }
+
   requireRefreshToken();
 
   const url = `${CONFIG.clerkBaseUrl}/v1/client?_clerk_js_version=${encodeURIComponent(CONFIG.clerkJsVersion)}`;
@@ -1913,7 +1957,6 @@ async function fetchClerkClient() {
       Origin: 'https://suno.com',
       Referer: 'https://suno.com/',
     },
-    // 4xx'leri de yakalayip anlamli hata uretmek icin:
     validateStatus: (status) => status >= 200 && status < 400,
   });
 
@@ -1926,7 +1969,6 @@ async function fetchClerkClient() {
     );
   }
 
-  // En uygun oturumu sec: aktif olan > last_active_session_id > ilk siradaki
   const activeSession =
     sessions.find((s) => s && s.status === 'active') ||
     sessions.find((s) => s && s.id === client.last_active_session_id) ||
@@ -1940,10 +1982,19 @@ async function fetchClerkClient() {
 
 /**
  * (B) Session id'den taze JWT al.
- * Clerk burada yeni bir access token uretir; bu token Suno API'sinde Bearer
- * olarak kullanilir.
  */
-async function requestSessionToken(sessionId) {
+async function requestSessionToken(sessionId, account = null) {
+  const act = account || accountPool.getActiveAccount();
+  if (act) {
+    return act.requestSessionToken(sessionId, {
+      clerkBaseUrl: CONFIG.clerkBaseUrl,
+      clerkJsVersion: CONFIG.clerkJsVersion,
+      requestTimeoutMs: CONFIG.requestTimeoutMs,
+      userAgent: BROWSER_UA,
+      log,
+    });
+  }
+
   requireRefreshToken();
 
   const url =
@@ -1973,10 +2024,19 @@ async function requestSessionToken(sessionId) {
 
 /**
  * (C) Keep-alive: oturumu "dokunulmus" isaretle.
- * Bu cagri olmadan Clerk oturumu hareketsizlikten dusurebilir.
- * Hata olursa akisi bozmuyoruz (kritik degil, sadece uyari logluyoruz).
  */
-async function touchSession(sessionId) {
+async function touchSession(sessionId, account = null) {
+  const act = account || accountPool.getActiveAccount();
+  if (act) {
+    return act.touchSession({
+      clerkBaseUrl: CONFIG.clerkBaseUrl,
+      clerkJsVersion: CONFIG.clerkJsVersion,
+      requestTimeoutMs: CONFIG.requestTimeoutMs,
+      userAgent: BROWSER_UA,
+      log,
+    });
+  }
+
   const url =
     `${CONFIG.clerkBaseUrl}/v1/client/sessions/${encodeURIComponent(sessionId)}/touch` +
     `?_clerk_js_version=${encodeURIComponent(CONFIG.clerkJsVersion)}`;
@@ -2004,52 +2064,55 @@ async function touchSession(sessionId) {
 /**
  * Token'i yenile. Single-flight: ayni anda birden fazla cagri gelirse
  * tek bir Promise paylasilir.
- *
- * @param {boolean} force true ise token suresi dolmamis olsa bile yenilenir.
- * @returns {Promise<string>} gecerli access token
  */
-async function refreshAccessToken(force = false) {
-  // __client yoksa yenileme yapilamaz; elle yapistirilmis JWT varsa onu ver.
+async function refreshAccessToken(force = false, account = null) {
+  const act = account || accountPool.getActiveAccount();
+  if (act) {
+    return act.refreshAccessToken(force, {
+      clerkBaseUrl: CONFIG.clerkBaseUrl,
+      clerkJsVersion: CONFIG.clerkJsVersion,
+      requestTimeoutMs: CONFIG.requestTimeoutMs,
+      refreshBeforeExpiryMs: CONFIG.refreshBeforeExpiryMs,
+      userAgent: BROWSER_UA,
+      log,
+    });
+  }
+
   if (!CONFIG.refreshToken) {
     if (CONFIG.sessionToken) return CONFIG.sessionToken;
     throw new Error('Yenileme icin SUNO_REFRESH_TOKEN (__client) gerekli.');
   }
 
-  // Hala gecerliyse ve zorlanmiyorsa mevcut token'i dondur.
   const now = Date.now();
   const stillValid =
-    authState.accessToken && (authState.expiresAt === 0 || authState.expiresAt - CONFIG.refreshBeforeExpiryMs > now);
-  if (!force && stillValid) return authState.accessToken;
+    fallbackAuthState.accessToken &&
+    (fallbackAuthState.expiresAt === 0 || fallbackAuthState.expiresAt - CONFIG.refreshBeforeExpiryMs > now);
+  if (!force && stillValid) return fallbackAuthState.accessToken;
 
-  // Devam eden bir yenileme varsa onu bekle.
-  if (authState.inFlight) return authState.inFlight;
+  if (fallbackAuthState.inFlight) return fallbackAuthState.inFlight;
 
-  authState.inFlight = (async () => {
+  fallbackAuthState.inFlight = (async () => {
     const startedAt = Date.now();
     try {
-      // 1) Session id yoksa Clerk'ten ogren.
-      if (!authState.sessionId) {
+      if (!fallbackAuthState.sessionId) {
         const { sessionId, fallbackJwt } = await fetchClerkClient();
-        authState.sessionId = sessionId;
+        fallbackAuthState.sessionId = sessionId;
         if (fallbackJwt) {
-          authState.accessToken = fallbackJwt;
-          authState.expiresAt = getTokenExpiryMs(fallbackJwt);
+          fallbackAuthState.accessToken = fallbackJwt;
+          fallbackAuthState.expiresAt = getTokenExpiryMs(fallbackJwt);
         }
       }
 
-      // 2) Taze JWT iste.
       let jwt;
       try {
-        jwt = await requestSessionToken(authState.sessionId);
+        jwt = await requestSessionToken(fallbackAuthState.sessionId);
       } catch (tokenErr) {
-        // Session id eskimis olabilir -> Clerk'ten yeniden ogrenip 1 kez tekrar dene.
         log('warn', 'Token istegi basarisiz, session id yeniden cozuluyor.', sanitizeMessage(tokenErr.message));
         const { sessionId, fallbackJwt } = await fetchClerkClient();
-        authState.sessionId = sessionId;
+        fallbackAuthState.sessionId = sessionId;
         try {
           jwt = await requestSessionToken(sessionId);
         } catch (retryErr) {
-          // Son sans: last_active_token.jwt (yine de ise yarayabilir).
           if (fallbackJwt) {
             log('warn', 'tokens uc noktasi basarisiz, last_active_token.jwt kullaniliyor.');
             jwt = fallbackJwt;
@@ -2059,47 +2122,54 @@ async function refreshAccessToken(force = false) {
         }
       }
 
-      // 3) Bellege yaz.
-      authState.accessToken = jwt;
-      authState.expiresAt = getTokenExpiryMs(jwt);
-      authState.lastRefreshAt = Date.now();
-      authState.lastError = null;
-      authState.refreshCount += 1;
+      fallbackAuthState.accessToken = jwt;
+      fallbackAuthState.expiresAt = getTokenExpiryMs(jwt);
+      fallbackAuthState.lastRefreshAt = Date.now();
+      fallbackAuthState.lastError = null;
+      fallbackAuthState.refreshCount += 1;
 
-      const ttlSec = authState.expiresAt ? Math.round((authState.expiresAt - Date.now()) / 1000) : null;
+      const ttlSec = fallbackAuthState.expiresAt ? Math.round((fallbackAuthState.expiresAt - Date.now()) / 1000) : null;
       log('info', 'Access token yenilendi.', {
-        sessionId: authState.sessionId,
+        sessionId: fallbackAuthState.sessionId,
         ttlSeconds: ttlSec,
         tookMs: Date.now() - startedAt,
       });
 
       return jwt;
     } catch (err) {
-      authState.lastError = sanitizeMessage(err.message);
-      // Hatayi etiketle: route katmani bunu 500 yerine anlamli bir 502'ye cevirsin.
+      fallbackAuthState.lastError = sanitizeMessage(err.message);
       err.code = err.code || 'AUTH_ERROR';
       err.isAuthError = true;
-      log('error', 'Token yenileme basarisiz.', authState.lastError);
+      log('error', 'Token yenileme basarisiz.', fallbackAuthState.lastError);
       throw err;
     } finally {
-      authState.inFlight = null;
+      fallbackAuthState.inFlight = null;
     }
   })();
 
-  return authState.inFlight;
+  return fallbackAuthState.inFlight;
 }
 
 /**
- * Her API isteginden hemen once cagrilir: token gecerli mi kontrol eder,
- * gerekirse yeniler. Boylece "token suresi doldu" hatalari kullaniciya
- * yansimaz.
+ * Her API isteginden hemen once cagrilir: token gecerli mi kontrol eder, gerekirse yeniler.
  */
-async function getValidToken() {
-  // (0) __client yok ama elle yapistirilmis bir JWT varsa: dogrudan onu kullan.
+async function getValidToken(account = null) {
+  const act = account || accountPool.getActiveAccount();
+  if (act) {
+    return act.getValidToken({
+      clerkBaseUrl: CONFIG.clerkBaseUrl,
+      clerkJsVersion: CONFIG.clerkJsVersion,
+      requestTimeoutMs: CONFIG.requestTimeoutMs,
+      refreshBeforeExpiryMs: CONFIG.refreshBeforeExpiryMs,
+      userAgent: BROWSER_UA,
+      log,
+    });
+  }
+
   if (!CONFIG.refreshToken) {
     if (CONFIG.sessionToken) {
-      authState.accessToken = CONFIG.sessionToken;
-      authState.expiresAt = getTokenExpiryMs(CONFIG.sessionToken);
+      fallbackAuthState.accessToken = CONFIG.sessionToken;
+      fallbackAuthState.expiresAt = getTokenExpiryMs(CONFIG.sessionToken);
       return CONFIG.sessionToken;
     }
     throw new Error(
@@ -2108,27 +2178,18 @@ async function getValidToken() {
   }
 
   const now = Date.now();
-  const hasToken = Boolean(authState.accessToken);
-  const expiringSoon = authState.expiresAt !== 0 && authState.expiresAt - CONFIG.refreshBeforeExpiryMs <= now;
+  const hasToken = Boolean(fallbackAuthState.accessToken);
+  const expiringSoon =
+    fallbackAuthState.expiresAt !== 0 && fallbackAuthState.expiresAt - CONFIG.refreshBeforeExpiryMs <= now;
 
-  if (hasToken && !expiringSoon) return authState.accessToken;
-  return refreshAccessToken(!hasToken); // token yoksa force=true gibi davran
+  if (hasToken && !expiringSoon) return fallbackAuthState.accessToken;
+  return refreshAccessToken(!hasToken);
 }
 
 // ============================================================================
 // 4. SUNO STUDIO API ISTEMCISI
 // ============================================================================
 
-/**
- * Suno'nun web bundle'indan (chunk: 2uv-qdm-0aanh.js) birebir alinan algoritma:
- *
- *   const payload = { token: btoa(JSON.stringify({ timestamp: Date.now() })) };
- *   headers['Browser-Token'] = JSON.stringify(payload);
- *
- * Yani header degeri DUZ base64 DEGIL, icinde base64 tasiyan bir JSON string'idir:
- *   {"token":"eyJ0aW1lc3RhbXAiOjE3OTIzNzgzMzA5NDV9"}
- * Bu header olmadan Suno 401 dondurur (anti-replay korumasi).
- */
 function buildBrowserToken() {
   if (CONFIG.browserTokenOverride) return CONFIG.browserTokenOverride;
   try {
@@ -2139,10 +2200,8 @@ function buildBrowserToken() {
   }
 }
 
-/** Cihaz kimligi: env > __client cookie'sindeki suno_device_id > kalici UUID. */
 function resolveDeviceId() {
   if (CONFIG.deviceId) return CONFIG.deviceId;
-  // Ham cookie dokumunden gelen suno_device_id varsa onu kullan.
   const match = String(process.env.SUNO_COOKIE_JAR || '').match(/suno_device_id=([^;\s]+)/);
   if (match) return match[1];
   if (!resolveDeviceId._fallback) {
@@ -2153,7 +2212,7 @@ function resolveDeviceId() {
 }
 
 /** Suno API'sine gonderilecek ortak header seti. */
-function buildSunoHeaders(token) {
+function buildSunoHeaders(token, account = null) {
   const headers = {
     Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
@@ -2163,13 +2222,12 @@ function buildSunoHeaders(token) {
     Referer: 'https://suno.com/',
   };
 
-  // Anti-replay + cihaz kimligi. Suno 2026-05'ten beri bunlari zorunlu tutuyor.
   headers['Browser-Token'] = buildBrowserToken();
   headers['Device-Id'] = resolveDeviceId();
 
-  // __client cookie'sini de iletiyoruz (bazi uc noktalar istiyor).
-  if (CONFIG.forwardClientCookie && CONFIG.refreshToken) {
-    headers.Cookie = buildCookieHeader();
+  if (CONFIG.forwardClientCookie) {
+    const cookie = buildCookieHeader(account);
+    if (cookie) headers.Cookie = cookie;
   }
 
   return headers;
@@ -2182,18 +2240,21 @@ function buildSunoHeaders(token) {
  * @param {'get'|'post'} method
  * @param {string} path  orn: "/api/generate/v2/"
  * @param {object} [body]
+ * @param {object} [options] { account, clipId }
  */
-async function sunoRequest(method, path, body) {
+async function sunoRequest(method, path, body, options = {}) {
   const url = `${CONFIG.sunoApiBase}${path}`;
+  const account =
+    options.account ||
+    (options.clipId ? accountPool.getAccountForClip(options.clipId) : accountPool.getActiveAccount());
 
   const execute = async (forceRefresh) => {
-    const token = forceRefresh ? await refreshAccessToken(true) : await getValidToken();
+    const token = forceRefresh ? await refreshAccessToken(true, account) : await getValidToken(account);
     const config = {
       method,
       url,
       timeout: CONFIG.requestTimeoutMs,
-      headers: buildSunoHeaders(token),
-      // 4xx'leri kendimiz yorumlayacagiz -> axios throw etmesin.
+      headers: buildSunoHeaders(token, account),
       validateStatus: () => true,
     };
     if (body !== undefined) config.data = body;
@@ -2202,27 +2263,22 @@ async function sunoRequest(method, path, body) {
 
   let response = await execute(false);
 
-  // Token gecersizligi: 401/403 VE 422 token_validation_failed.
-  // 422'yi de yakaliyoruz cunku Suno taze olmayan JWT icin 422 donuyor.
   const bodyText = typeof response.data === 'string' ? response.data : JSON.stringify(response.data || {});
   const tokenRejected =
     response.status === 401 ||
     response.status === 403 ||
     (response.status === 422 && /token_validation_failed|verify your request/i.test(bodyText));
 
-  if (tokenRejected && CONFIG.refreshToken) {
+  if (tokenRejected && (account || CONFIG.refreshToken)) {
     log('warn', `Suno API ${response.status} (token reddi), zorla yenile + tekrar dene.`, path);
     response = await execute(true);
-  } else if (tokenRejected && !CONFIG.refreshToken) {
-    // Yenileme yolu yok: kullaniciya ne yapacagini net soyle.
+  } else if (tokenRejected && !account && !CONFIG.refreshToken) {
     const e = new Error('Suno oturumu gecersiz. Taze token gerekli.');
     e.status = 401;
     e.code = 'SESSION_EXPIRED';
     e.detail =
       'SUNO_REFRESH_TOKEN (__client cookie) tanimli degil, bu yuzden otomatik yenileme yapilamiyor. ' +
-      'Cozum: DevTools > Network > filtre "auth.suno" > istege sag tik > Copy as cURL; ' +
-      'Cookie basligindaki __client degerini SUNO_REFRESH_TOKEN ' +
-      'olarak ekle; sonrasinda token otomatik yenilenir. Alternatif: /auth/token ile taze JWT gonder.';
+      'Cookie basligindaki __client degerini SUNO_REFRESH_TOKEN veya SUNO_REFRESH_TOKENS olarak ekleyin.';
     throw e;
   }
 
@@ -2324,8 +2380,11 @@ providerRegistry.providers.suno.init({
   defaultModel: CONFIG.defaultModel,
   defaultInstrumental: CONFIG.defaultInstrumental,
   generatePath: CONFIG.generatePath,
-  hasRefreshToken: Boolean(CONFIG.refreshToken),
+  hasRefreshToken: Boolean(CONFIG.refreshToken || accountPool.size() > 0),
   hasSessionToken: Boolean(CONFIG.sessionToken),
+  accountPool,
+  isCreditExhaustedError,
+  log,
 });
 
 /**
@@ -2631,10 +2690,11 @@ app.get('/health', (_req, res) => {
     uptimeSeconds: Math.round(process.uptime()),
     memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
     auth: {
-      hasRefreshToken: Boolean(CONFIG.refreshToken),
-      // full = sunucu token'i kendi yeniler (__client var)
-      // manual = yalnizca yapistirilmis JWT var, suresi dolunca durur
-      refreshMode: CONFIG.refreshToken ? 'full' : CONFIG.sessionToken ? 'manual' : 'none',
+      hasRefreshToken: Boolean(CONFIG.refreshToken || accountPool.size() > 0),
+      totalAccounts: accountPool.size(),
+      availableAccounts: accountPool.getAvailableAccounts().length,
+      activeAccountId: accountPool.getActiveAccount() ? accountPool.getActiveAccount().id : null,
+      refreshMode: (CONFIG.refreshToken || accountPool.size() > 0) ? 'full' : CONFIG.sessionToken ? 'manual' : 'none',
       hasSessionToken: Boolean(CONFIG.sessionToken),
       hasAccessToken: Boolean(authState.accessToken),
       sessionId: authState.sessionId,
@@ -2643,12 +2703,13 @@ app.get('/health', (_req, res) => {
       refreshCount: authState.refreshCount,
       lastError: authState.lastError,
     },
+    accountPool: accountPool.getStatus(),
     provider: {
       name: providerRegistry.getProviderName(),
       available: providerRegistry.listProviders(),
       audioEndpointConfigured:
         providerRegistry.getProviderName() === 'suno'
-          ? Boolean(CONFIG.refreshToken || CONFIG.sessionToken)
+          ? Boolean(CONFIG.refreshToken || CONFIG.sessionToken || accountPool.size() > 0)
           : undefined,
     },
     tls: {
@@ -2680,6 +2741,29 @@ app.get('/health', (_req, res) => {
       clerkBaseUrl: CONFIG.clerkBaseUrl,
       defaultModel: CONFIG.defaultModel,
     },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /auth/pool -> Coklu hesap havuzu detayli durum sorgusu
+// ---------------------------------------------------------------------------
+app.get('/auth/pool', apiKeyGuard, (_req, res) => {
+  res.json({
+    ok: true,
+    pool: accountPool.getStatus(),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/reset-limits -> Tukenmis tum hesaplarin limit durumlarini elle sifirla
+// ---------------------------------------------------------------------------
+app.post('/auth/reset-limits', apiKeyGuard, (_req, res) => {
+  accountPool.resetAllExhausted();
+  log('info', 'Tum Suno hesaplarinin limit durumlari elle sifirlandi.');
+  res.json({
+    ok: true,
+    message: 'Tum Suno hesaplarinin limit durumlari sifirlandi.',
+    pool: accountPool.getStatus(),
   });
 });
 
@@ -4150,6 +4234,22 @@ let keepAliveTimer = null;
  * Hata olsa bile dongu devam eder (Render uykuya dalsa da servis ayaga kalkar).
  */
 async function keepAliveTick() {
+  if (accountPool && accountPool.size() > 0) {
+    try {
+      await accountPool.keepAliveAll({
+        clerkBaseUrl: CONFIG.clerkBaseUrl,
+        clerkJsVersion: CONFIG.clerkJsVersion,
+        requestTimeoutMs: CONFIG.requestTimeoutMs,
+        refreshBeforeExpiryMs: CONFIG.refreshBeforeExpiryMs,
+        userAgent: BROWSER_UA,
+        log,
+      });
+    } catch (err) {
+      log('error', 'Havuz keep-alive turu basarisiz.', sanitizeMessage(err.message));
+    }
+    return;
+  }
+
   if (!CONFIG.refreshToken) {
     log('warn', 'Keep-alive atlandi: SUNO_REFRESH_TOKEN yok.');
     return;
@@ -4158,7 +4258,6 @@ async function keepAliveTick() {
     if (authState.sessionId) await touchSession(authState.sessionId);
     await refreshAccessToken(true);
   } catch (err) {
-    // Ust uste basarisizliklarda sesli uyar; kisa hatalarda debug seviyesinde kal.
     log('error', 'Keep-alive turu basarisiz.', sanitizeMessage(err.message));
   }
 }
