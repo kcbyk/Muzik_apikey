@@ -4072,8 +4072,10 @@ app.get('/debug/tls', apiKeyGuard, async (req, res) => {
 //    - siteden uretilen "client" anahtarlar              -> uretemez (403)
 //    - hic anahtar yoksa ilk uretim serbesttir (bootstrap)
 // ---------------------------------------------------------------------------
-app.get('/keys', apiKeyGuard, (req, res) => {
-  if (!requireKeyAdmin(req, res)) return undefined;
+// ---------------------------------------------------------------------------
+// /keys — API Anahtari Yonetimi (Herkese Acik & Serbest Uretim)
+// ---------------------------------------------------------------------------
+app.get('/keys', (_req, res) => {
   return res.json({
     ok: true,
     keys: keyStore.list(),
@@ -4081,21 +4083,12 @@ app.get('/keys', apiKeyGuard, (req, res) => {
   });
 });
 
-app.post('/keys', apiKeyGuard, (req, res) => {
-  if (!requireKeyAdmin(req, res)) return undefined;
-
+app.post('/keys', (req, res) => {
   const body = req.body || {};
   const name = String(body.name || '').trim();
 
-  // Bootstrap: baska yonetici kaynagi yoksa ilk anahtar admin olur,
-  // aksi halde uretilen anahtarlar "client" (baska anahtar uretemez).
-  const hasAdminSource =
-    CONFIG.allowedApiKeys.length > 0 ||
-    Boolean(CONFIG.adminKey) ||
-    keyStore.list().some((k) => k.role === 'admin' && !k.revoked);
-
   try {
-    const { record, key } = keyStore.create(name, hasAdminSource ? 'client' : 'admin');
+    const { record, key } = keyStore.create(name, 'client');
     log('info', 'Yeni API anahtari uretildi.', { id: record.id, name: record.name, role: record.role });
     return res.status(201).json({
       ok: true,
@@ -4110,8 +4103,7 @@ app.post('/keys', apiKeyGuard, (req, res) => {
   }
 });
 
-app.delete('/keys/:id', apiKeyGuard, (req, res) => {
-  if (!requireKeyAdmin(req, res)) return undefined;
+app.delete('/keys/:id', (req, res) => {
   const id = String(req.params.id || '').trim();
   const removed = keyStore.remove(id);
   if (!removed) return sendError(res, 404, 'KEY_NOT_FOUND', `Anahtar bulunamadi: ${id}`);
@@ -4119,8 +4111,7 @@ app.delete('/keys/:id', apiKeyGuard, (req, res) => {
   return res.json({ ok: true, revoked: true, id, store: keyStore.stats_() });
 });
 
-app.post('/keys/:id/revoke', apiKeyGuard, (req, res) => {
-  if (!requireKeyAdmin(req, res)) return undefined;
+app.post('/keys/:id/revoke', (req, res) => {
   const id = String(req.params.id || '').trim();
   const ok = keyStore.revoke(id);
   if (!ok) return sendError(res, 404, 'KEY_NOT_FOUND', `Anahtar bulunamadi: ${id}`);

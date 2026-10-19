@@ -3,323 +3,467 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Muzik API — Beat Studio</title>
+<title>Müzik API — Geliştirici Portalı & Beat Stüdyosu</title>
 <style>
-  :root{
-    --bg:#0b0d12; --panel:#141821; --panel2:#1b2130; --line:#232a3a;
-    --text:#e8ecf4; --muted:#8b96ab; --accent:#6ea8fe; --accent2:#8b5cf6;
-    --ok:#34d399; --warn:#fbbf24; --err:#f87171; --radius:14px;
+  :root {
+    --bg: #090c10;
+    --panel: #131822;
+    --panel2: #1b2230;
+    --panel-hover: #222b3d;
+    --line: #242c3d;
+    --text: #f0f3f8;
+    --muted: #8c97ab;
+    --accent: #58a6ff;
+    --accent2: #8b5cf6;
+    --ok: #3fb950;
+    --ok-glow: rgba(63, 185, 80, 0.18);
+    --warn: #e3b341;
+    --err: #f85149;
+    --radius: 14px;
+    --glow: 0 8px 24px rgba(88, 166, 255, 0.18);
   }
-  *{box-sizing:border-box}
-  html,body{margin:0;padding:0}
-  body{
-    background:radial-gradient(1200px 600px at 15% -10%, #1a2133 0%, transparent 60%),
-               radial-gradient(900px 500px at 100% 0%, #201a33 0%, transparent 55%), var(--bg);
-    color:var(--text);
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Arial,sans-serif;
-    min-height:100vh; line-height:1.5;
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: radial-gradient(1100px 600px at 10% -5%, #182338 0%, transparent 60%),
+                radial-gradient(900px 500px at 95% 5%, #241938 0%, transparent 55%), var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Arial, sans-serif;
+    min-height: 100vh;
+    line-height: 1.5;
   }
-  a{color:var(--accent);text-decoration:none}
-  .wrap{max-width:1180px;margin:0 auto;padding:22px 18px 64px}
+  a { color: var(--accent); text-decoration: none; }
+  .wrap { max-width: 1140px; margin: 0 auto; padding: 22px 20px 70px; }
 
-  /* --- header --- */
-  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:22px}
-  .logo{
-    width:42px;height:42px;border-radius:12px;flex:0 0 auto;
-    background:linear-gradient(135deg,var(--accent),var(--accent2));
-    display:grid;place-items:center;font-size:22px;
-    box-shadow:0 8px 24px rgba(110,168,254,.25);
+  /* --- HEADER --- */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 22px;
+    padding-bottom: 18px;
+    border-bottom: 1px solid var(--line);
   }
-  h1{font-size:19px;margin:0;letter-spacing:-.2px}
-  .sub{color:var(--muted);font-size:12.5px;margin-top:2px}
-  .spacer{flex:1}
-  .badge{
-    display:inline-flex;align-items:center;gap:7px;font-size:12px;
-    background:var(--panel);border:1px solid var(--line);color:var(--muted);
-    padding:7px 11px;border-radius:999px;white-space:nowrap;
+  .logo {
+    width: 44px; height: 44px; border-radius: 12px; flex: 0 0 auto;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    display: grid; place-items: center; font-size: 24px;
+    box-shadow: var(--glow);
   }
-  .dot{width:8px;height:8px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 3px rgba(255,255,255,.04)}
-  .dot.ok{background:var(--ok)} .dot.err{background:var(--err)} .dot.warn{background:var(--warn)}
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.2px; font-weight: 700; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .spacer { flex: 1; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 7px; font-size: 12px;
+    background: var(--panel); border: 1px solid var(--line); color: var(--muted);
+    padding: 7px 12px; border-radius: 999px; white-space: nowrap;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .dot.err { background: var(--err); }
+  .dot.warn { background: var(--warn); }
 
-  /* --- layout --- */
-  .grid{display:grid;grid-template-columns:360px 1fr;gap:18px;align-items:start}
-  @media (max-width:920px){ .grid{grid-template-columns:1fr} }
+  /* --- NAVIGATION TABS --- */
+  .nav-tabs {
+    display: flex; gap: 8px; margin-bottom: 22px; border-bottom: 1px solid var(--line);
+    padding-bottom: 12px; flex-wrap: wrap;
+  }
+  .tab-btn {
+    background: transparent; border: 1px solid transparent; color: var(--muted);
+    padding: 9px 16px; border-radius: 10px; font-size: 13.5px; font-weight: 600;
+    cursor: pointer; display: inline-flex; align-items: center; gap: 8px;
+    transition: all 0.15s ease;
+  }
+  .tab-btn:hover { background: var(--panel); color: var(--text); }
+  .tab-btn.active {
+    background: var(--panel2); border-color: var(--line); color: var(--accent);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+  }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
 
-  .card{
-    background:linear-gradient(180deg,var(--panel),#12161e);
-    border:1px solid var(--line);border-radius:var(--radius);
-    padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.25);
+  /* --- CARDS & PANELS --- */
+  .card {
+    background: linear-gradient(180deg, var(--panel), #10141d);
+    border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 22px; box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+    margin-bottom: 20px;
   }
-  .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);margin:0 0 14px}
+  .card-header { margin-bottom: 16px; }
+  .card-header h2 {
+    font-size: 15px; margin: 0 0 4px; font-weight: 700; color: #fff;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .card-header p { font-size: 12.5px; color: var(--muted); margin: 0; }
 
-  /* --- form --- */
-  label{display:block;font-size:12.5px;color:var(--muted);margin:0 0 6px}
-  input[type=text],input[type=password],textarea,select{
-    width:100%;background:#0e121a;border:1px solid var(--line);color:var(--text);
-    border-radius:10px;padding:11px 12px;font:inherit;font-size:14px;outline:none;
-    transition:border-color .15s, box-shadow .15s;
+  /* --- FORMS & INPUTS --- */
+  label { display: block; font-size: 12.5px; color: var(--muted); margin: 0 0 6px; font-weight: 500; }
+  input[type=text], input[type=password], textarea, select {
+    width: 100%; background: #0c1017; border: 1px solid var(--line); color: var(--text);
+    border-radius: 10px; padding: 12px 14px; font: inherit; font-size: 14px; outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
   }
-  input:focus,textarea:focus,select:focus{border-color:#3a4a6b;box-shadow:0 0 0 3px rgba(110,168,254,.12)}
-  textarea{resize:vertical;min-height:86px}
-  .field{margin-bottom:13px}
-  .row{display:flex;gap:10px}
-  .row>*{flex:1}
-  .btn{
-    display:inline-flex;align-items:center;justify-content:center;gap:8px;
-    border:1px solid transparent;border-radius:10px;padding:11px 14px;
-    font:inherit;font-size:14px;font-weight:600;cursor:pointer;
-    transition:transform .06s, filter .15s, background .15s;
-    white-space:nowrap;
+  input:focus, textarea:focus, select:focus {
+    border-color: #3b5078; box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.12);
   }
-  .btn:active{transform:translateY(1px)}
-  .btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#06080d;width:100%}
-  .btn-primary:disabled{opacity:.55;cursor:not-allowed}
-  .btn-ghost{background:var(--panel2);border-color:var(--line);color:var(--text)}
-  .btn-ghost:hover{background:#232b3d}
-  .btn-sm{padding:7px 11px;font-size:12.5px;border-radius:9px}
-  .switch{display:flex;align-items:center;gap:9px;font-size:13.5px;color:var(--text);user-select:none}
-  .switch input{width:16px;height:16px;accent-color:var(--accent)}
+  textarea { resize: vertical; min-height: 90px; }
+  .field { margin-bottom: 14px; }
+  .row { display: flex; gap: 12px; }
+  .row > * { flex: 1; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    border: 1px solid transparent; border-radius: 10px; padding: 11px 16px;
+    font: inherit; font-size: 14px; font-weight: 600; cursor: pointer;
+    transition: transform 0.06s, filter 0.15s, background 0.15s; white-space: nowrap;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn-primary {
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: #fff; box-shadow: 0 4px 14px rgba(88, 166, 255, 0.25);
+  }
+  .btn-primary:hover { filter: brightness(1.1); }
+  .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
+  .btn-ghost { background: var(--panel2); border-color: var(--line); color: var(--text); }
+  .btn-ghost:hover { background: var(--panel-hover); border-color: #354157; }
+  .btn-danger { background: rgba(248, 81, 73, 0.1); border-color: rgba(248, 81, 73, 0.25); color: var(--err); }
+  .btn-danger:hover { background: rgba(248, 81, 73, 0.2); }
+  .btn-sm { padding: 7px 12px; font-size: 12.5px; border-radius: 8px; }
+  .switch { display: flex; align-items: center; gap: 9px; font-size: 13.5px; color: var(--text); user-select: none; }
+  .switch input { width: 16px; height: 16px; accent-color: var(--accent); }
 
-  .hint{font-size:11.5px;color:var(--muted);margin-top:7px}
-  .hint b{color:#b9c6de;font-weight:600}
-
-  /* --- key creation --- */
-  .keyout{
-    display:flex;align-items:center;gap:8px;background:#0a0e15;border:1px solid var(--line);
-    border-radius:10px;padding:8px 10px;margin:8px 0;
+  /* --- NEW KEY HIGHLIGHT BOX --- */
+  .new-key-banner {
+    background: linear-gradient(180deg, #102117, #0d1a12);
+    border: 1px solid #238636; border-radius: 12px; padding: 16px; margin: 16px 0;
+    box-shadow: 0 8px 24px var(--ok-glow); animation: fadeIn 0.2s ease-out;
   }
-  .keyout code{flex:1;min-width:0;font-size:12px;color:#b9f5d0;word-break:break-all;font-family:ui-monospace,Menlo,monospace}
-  .keyrow{
-    display:flex;align-items:center;gap:8px;padding:9px 0;border-bottom:1px solid var(--line);
-    font-size:12.5px;
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+  .new-key-banner .title { color: #7ee787; font-size: 13.5px; font-weight: 700; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .key-display {
+    display: flex; align-items: center; gap: 10px; background: #070e0a;
+    border: 1px solid #238636; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px;
   }
-  .keyrow:last-child{border-bottom:none}
-  .keyrow .kn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .keyrow .kp{color:var(--muted);font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
-  .role{font-size:10px;padding:2px 7px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
-  .role.admin{color:var(--accent);border-color:rgba(110,168,254,.4);background:rgba(110,168,254,.08)}
-  details.manage summary{cursor:pointer;font-size:12px;color:var(--muted);list-style:none;margin-top:12px}
-  details.manage summary::-webkit-details-marker{display:none}
-
-  /* --- url downloader --- */
-  .urlrow{display:flex;gap:8px}
-  .urlrow input{flex:1;min-width:0}
-  .meta{
-    margin-top:10px;padding:10px 12px;border-radius:10px;background:#0e121a;
-    border:1px solid var(--line);font-size:12px;color:var(--muted);line-height:1.8;
-  }
-  .meta b{color:#c7d4e8;font-weight:600}
-  .meta .row2{display:flex;justify-content:space-between;gap:10px}
-
-  /* --- results --- */
-  .results-head{display:flex;align-items:center;gap:10px;margin-bottom:14px}
-  .results-head h2{margin:0}
-  .empty{
-    border:1px dashed var(--line);border-radius:var(--radius);padding:44px 20px;
-    text-align:center;color:var(--muted);font-size:13.5px;
-  }
-  .clips{display:grid;grid-template-columns:1fr;gap:14px}
-  .clip{
-    background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:14px;
-  }
-  .clip-top{display:flex;align-items:flex-start;gap:10px;margin-bottom:10px}
-  .clip-title{font-weight:600;font-size:15px;margin:0;letter-spacing:-.1px}
-  .clip-meta{font-size:12px;color:var(--muted);margin-top:3px}
-  .pill{
-    font-size:11px;padding:4px 9px;border-radius:999px;border:1px solid var(--line);
-    background:#0f1420;color:var(--muted);white-space:nowrap;
-  }
-  .pill.complete{color:var(--ok);border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.08)}
-  .pill.generating,.pill.queued,.pill.streaming{color:var(--warn);border-color:rgba(251,191,36,.3);background:rgba(251,191,36,.08)}
-  .pill.error{color:var(--err);border-color:rgba(248,113,113,.3);background:rgba(248,113,113,.08)}
-  audio{width:100%;height:38px;margin:6px 0 10px;border-radius:8px}
-  .clip-actions{display:flex;gap:8px;flex-wrap:wrap}
-  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--muted)}
-
-  /* --- log --- */
-  details.log{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}
-  details.log summary{cursor:pointer;font-size:12px;color:var(--muted);list-style:none}
-  details.log summary::-webkit-details-marker{display:none}
-  pre#log{
-    margin:10px 0 0;max-height:200px;overflow:auto;background:#0a0e15;border:1px solid var(--line);
-    border-radius:10px;padding:11px;font-size:11.5px;color:#9fb0c9;white-space:pre-wrap;word-break:break-word;
+  .key-display code {
+    flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 14px; color: #a6f3b8; word-break: break-all; font-weight: 600;
   }
 
-  /* --- toast --- */
-  #toast{
-    position:fixed;right:18px;bottom:18px;max-width:360px;z-index:50;
-    background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--accent);
-    border-radius:10px;padding:12px 14px;font-size:13px;box-shadow:0 12px 40px rgba(0,0,0,.45);
-    opacity:0;transform:translateY(8px);pointer-events:none;transition:opacity .2s, transform .2s;
+  /* --- TABLE FOR ACTIVE KEYS --- */
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+  table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
+  th { background: #0c1017; padding: 10px 14px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line); }
+  td { padding: 11px 14px; border-bottom: 1px solid var(--line); }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(255,255,255,0.015); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .tag { font-size: 11px; padding: 3px 8px; border-radius: 999px; background: rgba(88,166,255,0.1); color: var(--accent); border: 1px solid rgba(88,166,255,0.25); }
+
+  /* --- CODE SNIPPETS SECTION --- */
+  .code-tabs { display: flex; gap: 6px; margin: 12px 0 0; }
+  .code-tab-btn {
+    background: transparent; border: none; color: var(--muted); padding: 6px 12px;
+    font-size: 12px; font-weight: 600; border-radius: 6px 6px 0 0; cursor: pointer;
   }
-  #toast.show{opacity:1;transform:translateY(0)}
-  #toast.err{border-left-color:var(--err)}
-  #toast.ok{border-left-color:var(--ok)}
+  .code-tab-btn.active { background: #0b0f16; color: var(--accent); border: 1px solid var(--line); border-bottom: 1px solid #0b0f16; }
+  pre.code-block {
+    background: #0b0f16; border: 1px solid var(--line); border-radius: 0 8px 8px 8px;
+    padding: 14px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12.5px; color: #c9d1d9; overflow-x: auto; margin: 0 0 16px; line-height: 1.6;
+  }
+
+  /* --- STUDIO GRID --- */
+  .grid { display: grid; grid-template-columns: 380px 1fr; gap: 20px; align-items: start; }
+  @media (max-width: 940px) { .grid { grid-template-columns: 1fr; } }
+
+  /* --- CLIPS / AUDIO PLAYER --- */
+  .clips { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  .clip {
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 12px; padding: 16px;
+    transition: border-color 0.15s;
+  }
+  .clip:hover { border-color: #323d52; }
+  .clip-top { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px; }
+  .clip-title { font-weight: 700; font-size: 15px; margin: 0; }
+  .clip-meta { font-size: 12px; color: var(--muted); margin-top: 3px; }
+  .pill { font-size: 11px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); background: #0c1017; color: var(--muted); }
+  .pill.complete { color: var(--ok); border-color: rgba(63, 185, 80, 0.4); background: rgba(63, 185, 80, 0.1); }
+  .pill.streaming, .pill.generating, .pill.queued { color: var(--warn); border-color: rgba(227, 179, 65, 0.4); background: rgba(227, 179, 65, 0.1); }
+  .pill.error { color: var(--err); border-color: rgba(248, 81, 73, 0.4); background: rgba(248, 81, 73, 0.1); }
+  audio { width: 100%; height: 38px; margin: 8px 0 10px; border-radius: 8px; }
+
+  /* --- TOAST --- */
+  #toast {
+    position: fixed; right: 20px; bottom: 20px; max-width: 380px; z-index: 999;
+    background: var(--panel2); border: 1px solid var(--line); border-left: 4px solid var(--accent);
+    border-radius: 10px; padding: 12px 16px; font-size: 13.5px; box-shadow: 0 14px 45px rgba(0,0,0,0.5);
+    opacity: 0; transform: translateY(10px); pointer-events: none; transition: all 0.2s;
+  }
+  #toast.show { opacity: 1; transform: translateY(0); }
+  #toast.ok { border-left-color: var(--ok); }
+  #toast.err { border-left-color: var(--err); }
 </style>
 </head>
 <body>
 <div class="wrap">
+  <!-- HEADER -->
   <header>
     <div class="logo">🎧</div>
     <div>
-      <h1>Beat Studio</h1>
-      <div class="sub">Suno proxy — üret, dinle, indir</div>
+      <h1>Müzik API Developer Studio</h1>
+      <div class="sub">Suno v6 Altyapısı • Süresiz Hesap Havuzu • Otomatik DRM Şifre Çözücü</div>
     </div>
     <div class="spacer"></div>
-    <div class="badge" id="statusBadge"><span class="dot" id="statusDot"></span><span id="statusText">bağlantı kontrol ediliyor…</span></div>
-    <div class="badge" id="providerBadge" style="display:none">sağlayıcı: <b id="providerName" style="color:#b9c6de"></b></div>
+    <div class="badge" id="statusBadge"><span class="dot" id="statusDot"></span><span id="statusText">Sunucu kontrol ediliyor…</span></div>
+    <div class="badge" id="poolBadge">Havuz: <b id="poolStatusCount" style="color:var(--text);margin-left:4px">...</b></div>
   </header>
 
-  <div class="grid">
-    <!-- ============ SOL: FORMLAR ============ -->
-    <div>
-      <div class="card" style="margin-bottom:16px">
-        <h2>API Anahtarı</h2>
-        <div class="field">
-          <input type="password" id="apiKey" placeholder="x-api-key / ALLOWED_API_KEYS değeri" autocomplete="off" />
-          <div class="hint">Anahtar yalnızca bu tarayıcıda (<b>localStorage</b>) saklanır. İsteklere <code>x-api-key</code> başlığı olarak eklenir; ses çalar için <code>?api_key=</code> kullanılır.</div>
-        </div>
-        <div class="row">
-          <button class="btn btn-ghost btn-sm" id="saveKey">Kaydet</button>
-          <button class="btn btn-ghost btn-sm" id="testKey">Bağlantıyı test et</button>
-        </div>
-      </div>
+  <!-- NAVIGATION TABS -->
+  <div class="nav-tabs">
+    <button class="tab-btn active" data-tab="keys">🔑 API Anahtarı Oluştur & Yönet</button>
+    <button class="tab-btn" data-tab="studio">⚡ Beat Stüdyosu (Test & İndir)</button>
+    <button class="tab-btn" data-tab="pool">📊 Hesap Havuzu & Durum</button>
+    <button class="tab-btn" data-tab="downloader">⬇ URL İndirici</button>
+  </div>
 
-      <div class="card" style="margin-bottom:16px">
-        <h2>Anahtar Oluştur</h2>
-        <div class="field">
-          <label for="keyName">Anahtar adı</label>
-          <input type="text" id="keyName" placeholder="ör. telefon, demo, prod" />
-        </div>
-        <button class="btn btn-primary" id="createKey">＋ Yeni anahtar oluştur</button>
-
-        <div id="newKeyBox" style="display:none">
-          <div class="hint" style="margin-top:10px">⚠️ Bu anahtar <b>yalnızca bir kez</b> gösterilir — şimdi kopyala:</div>
-          <div class="keyout">
-            <code id="newKeyValue"></code>
-            <button class="btn btn-ghost btn-sm" id="copyKey">Kopyala</button>
-          </div>
-          <button class="btn btn-ghost btn-sm" id="useKey" style="width:100%">Bu anahtarı kullan</button>
-        </div>
-
-        <div class="hint">Anahtar üretmek için <b>yönetici</b> anahtarı gerekir (yukarıdaki alana gir ve kaydet). Hiç anahtar yoksa ilk üretim serbesttir.</div>
-
-        <details class="manage">
-          <summary>▸ Anahtarları yönet</summary>
-          <div id="keyList" style="margin-top:6px"></div>
-        </details>
-      </div>
-
-      <div class="card">
-        <h2>Yeni Beat</h2>
-        <div class="field">
-          <label for="prompt">İstem (prompt)</label>
-          <textarea id="prompt" placeholder="ör. karanlık drill beat, 808 bass, hüzünlü piyano"></textarea>
-        </div>
-        <div class="row">
-          <div class="field">
-            <label for="tags">Tarz / etiketler</label>
-            <input type="text" id="tags" placeholder="drill, trap, lo-fi" />
-          </div>
-          <div class="field">
-            <label for="title">Başlık</label>
-            <input type="text" id="title" placeholder="Proxy Test" />
-          </div>
-        </div>
-        <div class="field">
-          <label class="switch"><input type="checkbox" id="instrumental" checked /> Enstrümantal (vokalsiz)</label>
-        </div>
-        <button class="btn btn-primary" id="generate">⚡ Beat üret</button>
-        <div class="hint" id="genHint">Üretim genelde 30–90 sn sürer; sonuçlar otomatik olarak yoklanır.</div>
-      </div>
-    </div>
-
-      <div class="card">
-        <h2>URL'den İndir</h2>
-        <div class="field">
-          <label for="dlUrl">Dosya adresi</label>
-          <input type="text" id="dlUrl" placeholder="https://…/dosya.mp3" />
-        </div>
-        <div class="urlrow">
-          <button class="btn btn-ghost btn-sm" id="dlInfo">Önizle</button>
-          <button class="btn btn-primary btn-sm" id="dlGo" style="flex:1">⬇ İndir</button>
-        </div>
-        <div id="dlMeta" class="meta" style="display:none"></div>
-        <div class="hint">Yalnızca sunucudaki allowlist'teki host'lar (<b>DOWNLOAD_ALLOWED_HOSTS</b>) kabul edilir. Sunucu baytları değiştirmez, olduğu gibi aktarır.</div>
-      </div>
-    </div>
-
-    <!-- ============ SAĞ: SONUÇLAR ============ -->
+  <!-- TAB 1: API KEYS MANAGER -->
+  <div class="tab-pane active" id="tab-keys">
+    <!-- CREATE KEY CARD -->
     <div class="card">
-      <div class="results-head">
-        <h2>Parçalar</h2>
-        <div class="spacer"></div>
-        <button class="btn btn-ghost btn-sm" id="refreshAll">Durumları yenile</button>
-        <button class="btn btn-ghost btn-sm" id="clearAll">Temizle</button>
+      <div class="card-header">
+        <h2>✨ Yeni API Anahtarı Oluştur</h2>
+        <p>Projelerin, mobil uygulamaların, Discord botların veya scriptlerin için anında çalışan bir API anahtarı üret. Admin şifresi veya ön izin gerekmez.</p>
       </div>
-      <div id="empty" class="empty">Henüz parça yok. Soldan bir istem yazıp <b>Beat üret</b>'e bas.</div>
-      <div class="clips" id="clips"></div>
 
-      <details class="log">
-        <summary>İstek / yanıt günlüğü</summary>
-        <pre id="log"></pre>
-      </details>
+      <div class="row" style="align-items:flex-end">
+        <div class="field" style="flex:2;margin-bottom:0">
+          <label for="keyName">Proje / Uygulama Adı</label>
+          <input type="text" id="keyName" placeholder="Örn: Discord Müzik Botu, Mobil Uygulama, Test Projesi" />
+        </div>
+        <div style="flex:1">
+          <button class="btn btn-primary" id="btnCreateKey" style="width:100%">＋ API Anahtarı Üret</button>
+        </div>
+      </div>
+
+      <!-- NEW KEY BANNER -->
+      <div id="newKeyBanner" class="new-key-banner" style="display:none">
+        <div class="title">🎉 API Anahtarınız Başarıyla Üretildi!</div>
+        <div class="key-display">
+          <code id="newKeyValue">sk_...</code>
+          <button class="btn btn-ghost btn-sm" id="btnCopyNewKey">📋 Kopyala</button>
+        </div>
+        <div class="row">
+          <button class="btn btn-ghost btn-sm" id="btnUseInStudio">⚡ Bu Anahtarla Beat Stüdyosuna Geç</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- EXISTING KEYS TABLE -->
+    <div class="card">
+      <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <h2>📋 Kayıtlı API Anahtarları</h2>
+          <p>Oluşturulmuş tüm aktif anahtarlar aşağıda listelenmektedir.</p>
+        </div>
+        <button class="btn btn-ghost btn-sm" id="btnRefreshKeys">🔄 Yenile</button>
+      </div>
+
+      <div class="table-wrap">
+        <table id="keysTable">
+          <thead>
+            <tr>
+              <th>Ad / Proje</th>
+              <th>Anahtar Ön Eki</th>
+              <th>Rol</th>
+              <th>Oluşturulma</th>
+              <th>Kullanım</th>
+              <th>İşlem</th>
+            </tr>
+          </thead>
+          <tbody id="keysTableBody">
+            <tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">Yükleniyor…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- INTEGRATION CODE EXAMPLES -->
+    <div class="card">
+      <div class="card-header">
+        <h2>💻 Projelerine Entegre Et</h2>
+        <p>Ürettiğin API anahtarını <code>x-api-key</code> başlığı olarak ekleyerek hemen müzik üretebilirsin.</p>
+      </div>
+
+      <div class="code-tabs">
+        <button class="code-tab-btn active" data-code="curl">cURL / Terminal</button>
+        <button class="code-tab-btn" data-code="js">Node.js / Axios</button>
+        <button class="code-tab-btn" data-code="python">Python</button>
+      </div>
+
+      <pre class="code-block" id="codeBlock">curl -X POST https://muzik-apikey.onrender.com/generate-beat \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "duygusal akustik gitar beat, trap ritim, sakin melodi",
+    "title": "Akustik Beat",
+    "make_instrumental": true
+  }'</pre>
+    </div>
+  </div>
+
+  <!-- TAB 2: BEAT STUDIO -->
+  <div class="tab-pane" id="tab-studio">
+    <div class="grid">
+      <!-- SOL: FORM -->
+      <div>
+        <div class="card">
+          <div class="card-header">
+            <h2>🔑 Aktif Kullanılan Anahtar</h2>
+          </div>
+          <div class="field">
+            <input type="password" id="activeApiKey" placeholder="sk_... anahtarınızı girin veya soldan oluşturun" />
+            <div class="hint" style="font-size:11.5px;color:var(--muted);margin-top:6px">Anahtar tarayıcında saklanır.</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" id="btnSaveKey" style="width:100%">Anahtarı Kaydet</button>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2>⚡ Yeni Beat Üret</h2>
+          </div>
+          <div class="field">
+            <label for="prompt">İstem (Prompt)</label>
+            <textarea id="prompt" placeholder="ör. duygusal ve melodik akustik gitar beat, trap ritim, şarkı okumalık"></textarea>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label for="tags">Tarz / Etiketler</label>
+              <input type="text" id="tags" placeholder="acoustic guitar, chill trap, slow" />
+            </div>
+            <div class="field">
+              <label for="title">Başlık</label>
+              <input type="text" id="title" placeholder="Yeni Beat" />
+            </div>
+          </div>
+          <div class="field">
+            <label class="switch"><input type="checkbox" id="instrumental" checked /> Enstrümantal (Vokalsiz)</label>
+          </div>
+          <button class="btn btn-primary" id="btnGenerate" style="width:100%">⚡ Beat Üret</button>
+          <div class="hint" id="genHint" style="margin-top:8px;font-size:12px;color:var(--muted)">Üretim ortalama 30-60 saniye sürer.</div>
+        </div>
+      </div>
+
+      <!-- SAG: SONUCLAR -->
+      <div class="card">
+        <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+          <h2>🎵 Üretilen Parçalar</h2>
+          <div>
+            <button class="btn btn-ghost btn-sm" id="btnRefreshClips">Yenile</button>
+            <button class="btn btn-ghost btn-sm" id="btnClearClips">Temizle</button>
+          </div>
+        </div>
+        <div id="emptyClips" style="padding:40px 20px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:10px">Henüz parça üretilmedi. Soldaki formu doldurup <b>Beat Üret</b>'e bas.</div>
+        <div class="clips" id="clipsList"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 3: POOL & SYSTEM -->
+  <div class="tab-pane" id="tab-pool">
+    <div class="card">
+      <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <h2>📊 Suno Hesap Havuzu Durumu</h2>
+          <p>Sistemdeki tüm aktif ve süresiz refresh hesapları.</p>
+        </div>
+        <button class="btn btn-ghost btn-sm" id="btnResetPoolLimits">🔄 Sınırları Yenile</button>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Hesap ID</th>
+              <th>Tür</th>
+              <th>Durum</th>
+              <th>Kalan Süre</th>
+              <th>Toplam Üretim</th>
+            </tr>
+          </thead>
+          <tbody id="poolTableBody">
+            <tr><td colspan="5" style="text-align:center;padding:20px;color:var(--muted)">Yükleniyor…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h2>📡 İstek / Yanıt Günlüğü</h2>
+      </div>
+      <pre id="log" style="max-height:220px;overflow:auto;background:#0c1017;padding:12px;border:1px solid var(--line);border-radius:8px;font-size:12px;color:#9bb0cb"></pre>
+    </div>
+  </div>
+
+  <!-- TAB 4: DOWNLOADER -->
+  <div class="tab-pane" id="tab-downloader">
+    <div class="card">
+      <div class="card-header">
+        <h2>⬇ URL Doğrudan İndirme</h2>
+        <p>Suno CloudFront veya izin verilen ses bağlantılarını doğrudan sunucu üzerinden indir.</p>
+      </div>
+      <div class="field">
+        <label for="dlUrl">Dosya Bağlantısı</label>
+        <input type="text" id="dlUrl" placeholder="https://.../dosya.mp3" />
+      </div>
+      <div class="row">
+        <button class="btn btn-ghost btn-sm" id="btnDlInfo">Önizle</button>
+        <button class="btn btn-primary btn-sm" id="btnDlGo" style="flex:1">İndir</button>
+      </div>
+      <div id="dlMeta" style="display:none;margin-top:12px;padding:12px;background:#0c1017;border-radius:8px;border:1px solid var(--line);font-size:12px"></div>
     </div>
   </div>
 </div>
 
-<input type="hidden" id="newKey" />
 <div id="toast"></div>
 
 <script>
 (() => {
   'use strict';
 
-  // ---------------------------------------------------------------------
-  //  Durum
-  // ---------------------------------------------------------------------
   const LS_KEY = 'muzik.apiKey';
   const LS_CLIPS = 'muzik.clips';
   const state = {
     apiKey: localStorage.getItem(LS_KEY) || '',
-    clips: JSON.parse(localStorage.getItem(LS_CLIPS) || '[]'),
+    clips: JSON.parse(localStorage.getItem(LS_CLIPS) || '[]')
   };
 
   const $ = (id) => document.getElementById(id);
 
-  // ---------------------------------------------------------------------
-  //  Yardımcılar
-  // ---------------------------------------------------------------------
   function toast(msg, kind = '') {
     const el = $('toast');
     el.textContent = msg;
     el.className = 'show ' + kind;
     clearTimeout(toast._t);
-    toast._t = setTimeout(() => (el.className = kind), 3800);
+    toast._t = setTimeout(() => { el.className = ''; }, 3500);
   }
 
   function logLine(label, data) {
     const pre = $('log');
+    if (!pre) return;
     const ts = new Date().toLocaleTimeString('tr-TR');
     let body;
     try { body = typeof data === 'string' ? data : JSON.stringify(data, null, 2); }
     catch (_e) { body = String(data); }
-    pre.textContent = `[${ts}] ${label}\\n${body}\\n\\n` + pre.textContent;
-    if (pre.textContent.length > 20000) pre.textContent = pre.textContent.slice(0, 20000);
+    pre.textContent = `[${ts}] ${label}\n${body}\n\n` + pre.textContent;
   }
 
-  function saveClips() {
-    try { localStorage.setItem(LS_CLIPS, JSON.stringify(state.clips.slice(0, 30))); } catch (_e) {}
-  }
-
-  /** Tüm isteklere API anahtarını ekler. */
-  function headers(extra) {
-    const h = Object.assign({}, extra || {});
+  function headers(extra = {}) {
+    const h = { ...extra };
     if (state.apiKey) h['x-api-key'] = state.apiKey;
     return h;
   }
 
-  /** Header gönderemeyen istemciler (<audio>, indirme linki) için ?api_key=. */
   function withKey(url) {
     if (!state.apiKey) return url;
     return url + (url.includes('?') ? '&' : '?') + 'api_key=' + encodeURIComponent(state.apiKey);
@@ -327,428 +471,359 @@
 
   async function api(path, opts = {}) {
     const res = await fetch(path, { ...opts, headers: headers(opts.headers) });
-    let data = null;
     const text = await res.text();
+    let data = null;
     try { data = text ? JSON.parse(text) : null; } catch (_e) { data = { raw: text }; }
     if (!res.ok) {
       const err = new Error((data && data.error && data.error.message) || `HTTP ${res.status}`);
       err.status = res.status;
-      err.code = data && data.error && data.error.code;
       err.data = data;
       throw err;
     }
     return data;
   }
 
-  // ---------------------------------------------------------------------
-  //  Sağlık / durum
-  // ---------------------------------------------------------------------
-  async function refreshStatus() {
-    const dot = $('statusDot');
-    const txt = $('statusText');
-    try {
-      const h = await api('/health');
-      dot.className = 'dot ok';
-      txt.textContent = `çalışıyor · ${h.memoryMB} MB · ${h.security && h.security.apiKeyRequired ? 'korumalı' : 'açık'}`;
-      if (h.provider && h.provider.name) {
-        $('providerBadge').style.display = '';
-        $('providerName').textContent = h.provider.name;
-      }
-      return h;
-    } catch (err) {
-      dot.className = 'dot err';
-      txt.textContent = err.status === 401 ? 'API anahtarı gerekli' : 'ulaşılamıyor';
-      return null;
-    }
-  }
-
-  // ---------------------------------------------------------------------
-  //  Üretim
-  // ---------------------------------------------------------------------
-  async function generate() {
-    const prompt = $('prompt').value.trim();
-    if (!prompt) { toast('İstem (prompt) boş olamaz.', 'err'); $('prompt').focus(); return; }
-    if (!state.apiKey) { toast('Önce API anahtarını gir ve kaydet.', 'err'); $('apiKey').focus(); return; }
-
-    const btn = $('generate');
-    btn.disabled = true;
-    btn.textContent = '⏳ üretiliyor…';
-
-    const payload = {
-      prompt,
-      tags: $('tags').value.trim(),
-      title: $('title').value.trim(),
-      instrumental: $('instrumental').checked,
+  // --- TABS SWITCHER ---
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.onclick = () => {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      const target = $('tab-' + btn.dataset.tab);
+      if (target) target.classList.add('active');
+      if (btn.dataset.tab === 'keys') loadKeys();
+      if (btn.dataset.tab === 'pool') loadPool();
     };
+  });
 
-    try {
-      logLine('POST /generate-beat', payload);
-      const data = await api('/generate-beat', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      logLine('← yanıt', data);
+  // --- CODE SNIPPETS SWITCHER ---
+  const snippets = {
+    curl: `curl -X POST https://muzik-apikey.onrender.com/generate-beat \\
+  -H "x-api-key: YOUR_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "prompt": "duygusal akustik gitar beat, trap ritim, sakin melodi",
+    "title": "Akustik Beat",
+    "make_instrumental": true
+  }'`,
+    js: `const axios = require('axios');
 
-      const clips = (data.clips || []).map((c) => ({
-        id: c.id,
-        title: c.title || payload.title || 'Adsız beat',
-        tags: c.tags || payload.tags || '',
-        prompt: c.prompt || prompt,
-        status: c.status || 'queued',
-        duration: c.duration_seconds || null,
-        provider: data.provider || 'suno',
-        download_ready: null, // /track ile cozulecek
-        download_reason: null,
-        created_at: Date.now(),
-      }));
+async function createBeat() {
+  const res = await axios.post('https://muzik-apikey.onrender.com/generate-beat', {
+    prompt: 'duygusal akustik gitar beat, sakin ritim',
+    title: 'Akustik Beat',
+    make_instrumental: true
+  }, {
+    headers: { 'x-api-key': 'YOUR_API_KEY' }
+  });
+  console.log('Klip ID:', res.data.clip_ids[0]);
+}
+createBeat();`,
+    python: `import requests
 
-      state.clips = [...clips, ...state.clips].slice(0, 30);
-      saveClips();
-      render();
-      toast(`${clips.length} parça kuyruğa alındı.`, 'ok');
+res = requests.post('https://muzik-apikey.onrender.com/generate-beat', json={
+    'prompt': 'duygusal akustik gitar beat, trap ritim',
+    'title': 'Akustik Beat',
+    'make_instrumental': True
+}, headers={'x-api-key': 'YOUR_API_KEY'})
 
-      clips.forEach((c) => pollClip(c.id));
-    } catch (err) {
-      logLine('✖ hata', err.data || err.message);
-      toast(err.status === 401 ? 'API anahtarı geçersiz (401).' : 'Üretim başarısız: ' + err.message, 'err');
-    } finally {
-      btn.disabled = false;
-      btn.textContent = '⚡ Beat üret';
-    }
-  }
-
-  /** Klip durumunu tamamlanana kadar yoklar. */
-  async function pollClip(id, attempt = 0) {
-    const MAX = 60; // 60 x 3 sn = 3 dk
-    if (attempt > MAX) return;
-    try {
-      const data = await api('/track/' + encodeURIComponent(id));
-      const track = data.track || data;
-      const dl = data.download || null;
-      updateClip(id, {
-        status: track.status,
-        duration: track.duration_seconds,
-        title: track.title || undefined,
-        // otomatik indirme durumu (sunucu tamamlaninca cozer)
-        download_ready: Boolean(dl && dl.ready),
-        download_reason: dl && !dl.ready ? dl.reason : null,
-      });
-      if (track.status === 'complete' || track.is_error || track.status === 'error') {
-        logLine(`GET /track/${id.slice(0, 8)}`, { status: track.status, download: dl });
-        // Indirme hazirsa kullaniciya hemen bildir
-        if (dl && dl.ready) toast('Beat hazır — İndir aktif.', 'ok');
-        return;
-      }
-    } catch (err) {
-      if (err.status === 425 || err.status === 404) {
-        /* henüz hazır değil -> devam */
-      } else {
-        logLine('✖ track hatası', err.data || err.message);
-        return;
-      }
-    }
-    setTimeout(() => pollClip(id, attempt + 1), 3000);
-  }
-
-  function updateClip(id, patch) {
-    const c = state.clips.find((x) => x.id === id);
-    if (!c) return;
-    Object.assign(c, patch);
-    saveClips();
-    render();
-  }
-
-  // ---------------------------------------------------------------------
-  //  Render
-  // ---------------------------------------------------------------------
-  function pillClass(status) {
-    if (status === 'complete') return 'complete';
-    if (status === 'error') return 'error';
-    return 'generating';
-  }
-
-  function render() {
-    const box = $('clips');
-    const empty = $('empty');
-    if (!state.clips.length) {
-      empty.style.display = '';
-      box.innerHTML = '';
-      return;
-    }
-    empty.style.display = 'none';
-    box.innerHTML = '';
-
-    state.clips.forEach((c) => {
-      const el = document.createElement('div');
-      el.className = 'clip';
-
-      const dur = c.duration ? `${Math.round(c.duration)} sn` : '—';
-      const ready = c.status === 'complete';
-      // Klip tamamlandiysa indirme dogrudan aktif.
-      const canDownload = ready && c.download_ready !== false;
-
-      el.innerHTML = `
-        <div class="clip-top">
-          <div style="flex:1;min-width:0">
-            <p class="clip-title"></p>
-            <div class="clip-meta"></div>
-          </div>
-          <span class="pill ${pillClass(c.status)}"></span>
-        </div>
-        ${ready ? '<audio controls preload="none"></audio>' : ''}
-        <div class="clip-actions">
-          ${ready ? '<a class="btn btn-ghost btn-sm" download>⬇ MP3 indir</a>' : ''}
-          ${ready && c.download_ready === false ? '<span class="hint" data-dlmsg></span>' : ''}
-          <button class="btn btn-ghost btn-sm" data-act="refresh">↻ Durum</button>
-          <button class="btn btn-ghost btn-sm" data-act="remove">✕ Kaldır</button>
-        </div>
-      `;
-
-      // metinleri textContent ile yaz (XSS'e karsi)
-      el.querySelector('.clip-title').textContent = c.title || 'Adsız beat';
-      el.querySelector('.clip-meta').textContent = `${c.tags || 'etiket yok'} · ${dur} · ${String(c.id).slice(0, 8)}`;
-      el.querySelector('.pill').textContent = c.status;
-
-      if (ready) {
-        // Otomatik indirme hazirsa dogrudan /download?id= kullanilir (sunucu
-        // resmi indirme ucundan duz MP3 verir). Hazir degilse buton pasif.
-        const audio = el.querySelector('audio');
-        audio.src = withKey('/stream/' + encodeURIComponent(c.id));
-        const a = el.querySelector('a[download]');
-        if (canDownload) {
-          a.href = withKey('/download?id=' + encodeURIComponent(c.id));
-          a.setAttribute('download', `${(c.title || 'beat').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.mp3`);
-        } else {
-          a.removeAttribute('href');
-          a.style.opacity = '0.45';
-          a.style.pointerEvents = 'none';
-          a.title = 'Suno bu klip icin indirme izni vermedi';
-        }
-        const msg = el.querySelector('[data-dlmsg]');
-        if (msg) {
-          if (c.download_ready === null)
-            msg.textContent = 'indirme durumu kontrol ediliyor…';
-          else if (c.download_reason === 'download_not_authorized')
-            msg.textContent = 'indirme izni yok (not_authorized)';
-          else if (c.download_reason)
-            msg.textContent = `indirme hazır değil (${c.download_reason})`;
-          else msg.textContent = 'indirme hazır değil';
-        }
-      }
-
-      el.querySelector('[data-act="refresh"]').onclick = () => pollClip(c.id, 59);
-      el.querySelector('[data-act="remove"]').onclick = () => {
-        state.clips = state.clips.filter((x) => x.id !== c.id);
-        saveClips();
-        render();
-      };
-
-      box.appendChild(el);
-    });
-  }
-
-  // ---------------------------------------------------------------------
-  //  Olaylar
-  // ---------------------------------------------------------------------
-  $('apiKey').value = state.apiKey;
-
-  $('saveKey').onclick = () => {
-    state.apiKey = $('apiKey').value.trim();
-    localStorage.setItem(LS_KEY, state.apiKey);
-    toast(state.apiKey ? 'API anahtarı kaydedildi.' : 'Anahtar temizlendi.', 'ok');
-    refreshStatus();
+print(res.json())`
   };
 
-  $('testKey').onclick = async () => {
-    state.apiKey = $('apiKey').value.trim();
-    localStorage.setItem(LS_KEY, state.apiKey);
-    try {
-      const data = await api('/providers');
-      logLine('GET /providers', data);
-      toast('Bağlantı başarılı — anahtar geçerli.', 'ok');
-    } catch (err) {
-      logLine('✖ /providers', err.data || err.message);
-      toast(err.status === 401 ? 'Anahtar geçersiz (401).' : 'Bağlantı hatası: ' + err.message, 'err');
-    }
-    refreshStatus();
-  };
+  document.querySelectorAll('.code-tab-btn').forEach(b => {
+    b.onclick = () => {
+      document.querySelectorAll('.code-tab-btn').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+      const codeType = b.dataset.code;
+      const key = state.apiKey || 'YOUR_API_KEY';
+      $('codeBlock').textContent = snippets[codeType].replace(/YOUR_API_KEY/g, key);
+    };
+  });
 
-  // ---------------------------------------------------------------------
-  //  Anahtar üretimi / yönetimi
-  // ---------------------------------------------------------------------
-  async function createKey() {
+  // --- API KEY GENERATION ---
+  $('btnCreateKey').onclick = async () => {
     const name = $('keyName').value.trim();
-    const btn = $('createKey');
+    const btn = $('btnCreateKey');
     btn.disabled = true;
-    btn.textContent = '⏳ üretiliyor…';
+    btn.textContent = '⏳ Üretiliyor…';
+
     try {
       const data = await api('/keys', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ name }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
       });
-      logLine('POST /keys', { ok: data.ok, record: data.record });
+
       $('newKeyValue').textContent = data.key;
-      $('newKeyBox').style.display = '';
-      $('newKey').dataset.value = data.key;
+      $('newKeyBanner').style.display = 'block';
       $('keyName').value = '';
-      toast('Anahtar oluşturuldu — şimdi kopyala.', 'ok');
+
+      // Otomatik aktif et
+      state.apiKey = data.key;
+      localStorage.setItem(LS_KEY, data.key);
+      $('activeApiKey').value = data.key;
+
+      toast('✨ Yeni API Anahtarı üretildi!', 'ok');
       loadKeys();
+
+      // Snippetleri guncelle
+      const activeCodeBtn = document.querySelector('.code-tab-btn.active');
+      if (activeCodeBtn) {
+        $('codeBlock').textContent = snippets[activeCodeBtn.dataset.code].replace(/YOUR_API_KEY/g, data.key);
+      }
     } catch (err) {
-      logLine('✖ POST /keys', err.data || err.message);
-      toast(
-        err.status === 403
-          ? 'Yönetici anahtarı gerekli. Önce mevcut anahtarını gir.'
-          : err.status === 401
-            ? 'Geçerli bir anahtar gir (401).'
-            : 'Anahtar oluşturulamadı: ' + err.message,
-        'err',
-      );
+      toast('Anahtar üretilemedi: ' + err.message, 'err');
     } finally {
       btn.disabled = false;
-      btn.textContent = '＋ Yeni anahtar oluştur';
-    }
-  }
-
-  async function loadKeys() {
-    const box = $('keyList');
-    try {
-      const data = await api('/keys');
-      if (!data.keys.length) {
-        box.innerHTML = '<div class="hint">Kayıtlı anahtar yok.</div>';
-        return;
-      }
-      box.innerHTML = '';
-      data.keys.forEach((k) => {
-        const row = document.createElement('div');
-        row.className = 'keyrow';
-        row.innerHTML = `
-          <span class="kn"></span>
-          <span class="kp"></span>
-          <span class="role"></span>
-          <button class="btn btn-ghost btn-sm">iptal</button>`;
-        row.querySelector('.kn').textContent = k.name;
-        row.querySelector('.kp').textContent = k.prefix;
-        const role = row.querySelector('.role');
-        role.textContent = k.role;
-        if (k.role === 'admin') role.classList.add('admin');
-        const del = row.querySelector('button');
-        if (k.revoked) {
-          del.disabled = true;
-          del.textContent = 'iptal edildi';
-        }
-        del.onclick = async () => {
-          if (!confirm(`"${k.name}" anahtarı iptal edilsin mi?`)) return;
-          try {
-            await api('/keys/' + encodeURIComponent(k.id), { method: 'DELETE' });
-            toast('Anahtar iptal edildi.', 'ok');
-            loadKeys();
-          } catch (err) {
-            toast('İptal edilemedi: ' + err.message, 'err');
-          }
-        };
-        box.appendChild(row);
-      });
-    } catch (err) {
-      box.innerHTML = '';
-      const h = document.createElement('div');
-      h.className = 'hint';
-      h.textContent = err.status === 401 || err.status === 403
-        ? 'Listelemek için yönetici anahtarı gerekli.'
-        : 'Liste alınamadı: ' + err.message;
-      box.appendChild(h);
-    }
-  }
-
-  $('createKey').onclick = createKey;
-  $('copyKey').onclick = async () => {
-    const v = $('newKey').dataset.value || '';
-    try {
-      await navigator.clipboard.writeText(v);
-      toast('Kopyalandı.', 'ok');
-    } catch (_e) {
-      toast('Kopyalanamadı — metni seçip elle kopyala.', 'err');
+      btn.textContent = '＋ API Anahtarı Üret';
     }
   };
-  $('useKey').onclick = () => {
-    const v = $('newKey').dataset.value || '';
-    $('apiKey').value = v;
-    state.apiKey = v;
-    localStorage.setItem(LS_KEY, v);
-    toast('Anahtar kullanıma alındı.', 'ok');
+
+  $('btnCopyNewKey').onclick = async () => {
+    const key = $('newKeyValue').textContent;
+    try {
+      await navigator.clipboard.writeText(key);
+      toast('📋 Anahtar panoya kopyalandı!', 'ok');
+    } catch (_e) {
+      toast('Kopyalanamadı, elle seçip kopyalayın.', 'err');
+    }
+  };
+
+  $('btnUseInStudio').onclick = () => {
+    document.querySelector('[data-tab="studio"]').click();
+  };
+
+  $('btnRefreshKeys').onclick = loadKeys;
+
+  async function loadKeys() {
+    const tbody = $('keysTableBody');
+    try {
+      const res = await api('/keys');
+      if (!res.keys || !res.keys.length) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:20px;color:var(--muted)">Henüz kayıtlı API anahtarı yok. Yukarıdan bir tane oluşturabilirsiniz.</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = '';
+      res.keys.forEach(k => {
+        const tr = document.createElement('tr');
+        const dt = k.createdAt ? new Date(k.createdAt).toLocaleDateString('tr-TR') : '—';
+        tr.innerHTML = `
+          <td><b>${escapeHtml(k.name || 'İsimsiz')}</b></td>
+          <td><code class="mono" style="color:var(--ok)">${escapeHtml(k.prefix || 'sk_...')}</code></td>
+          <td><span class="tag">${k.role || 'client'}</span></td>
+          <td>${dt}</td>
+          <td>${k.useCount || 0}</td>
+          <td>
+            ${k.revoked ? '<span style="color:var(--muted);font-size:12px">İptal Edildi</span>' : `<button class="btn btn-danger btn-sm" data-id="${k.id}">İptal Et</button>`}
+          </td>
+        `;
+        const delBtn = tr.querySelector('button');
+        if (delBtn) {
+          delBtn.onclick = async () => {
+            if (!confirm(`"${k.name}" anahtarı iptal edilsin mi?`)) return;
+            try {
+              await api('/keys/' + encodeURIComponent(k.id), { method: 'DELETE' });
+              toast('Anahtar iptal edildi.', 'ok');
+              loadKeys();
+            } catch (e) {
+              toast('İptal başarısız: ' + e.message, 'err');
+            }
+          };
+        }
+        tbody.appendChild(tr);
+      });
+    } catch (e) {
+      tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--err);padding:20px">Yüklenemedi: ${e.message}</td></tr>`;
+    }
+  }
+
+  // --- STUDIO GENERATE & PLAYER ---
+  $('btnSaveKey').onclick = () => {
+    const val = $('activeApiKey').value.trim();
+    state.apiKey = val;
+    localStorage.setItem(LS_KEY, val);
+    toast('API Anahtarı kaydedildi.', 'ok');
     refreshStatus();
   };
 
-  // ---------------------------------------------------------------------
-  //  Kendi indirme servisi: URL'den indir
-  // ---------------------------------------------------------------------
-  function dlUrlValue() {
-    const u = $('dlUrl').value.trim();
-    if (!u) { toast('Önce bir dosya adresi gir.', 'err'); return ''; }
-    if (!/^https?:\/\//i.test(u)) { toast('Adres http(s):// ile başlamalı.', 'err'); return ''; }
-    return u;
+  $('btnGenerate').onclick = async () => {
+    const prompt = $('prompt').value.trim();
+    if (!prompt) return toast('Lütfen bir istem (prompt) yazın.', 'err');
+
+    const btn = $('btnGenerate');
+    btn.disabled = true;
+    btn.textContent = '⏳ Üretim Başlatılıyor…';
+
+    try {
+      const payload = {
+        prompt,
+        tags: $('tags').value.trim(),
+        title: $('title').value.trim() || 'Beat',
+        make_instrumental: $('instrumental').checked
+      };
+
+      const res = await api('/generate-beat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      logLine('POST /generate-beat', res);
+      const clips = res.clips || (res.clip_ids || []).map(id => ({ id, status: 'queued', title: payload.title }));
+      clips.forEach(c => {
+        state.clips.unshift(c);
+        pollClip(c.id);
+      });
+
+      saveClips();
+      renderClips();
+      toast('Üretim başlatıldı! Hazırlanıyor…', 'ok');
+    } catch (e) {
+      toast('Üretim hatası: ' + e.message, 'err');
+      logLine('✖ /generate-beat', e.data || e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '⚡ Beat Üret';
+    }
+  };
+
+  async function pollClip(clipId, maxTries = 40) {
+    for (let i = 0; i < maxTries; i++) {
+      await new Promise(r => setTimeout(r, 6000));
+      try {
+        const res = await api('/track/' + clipId);
+        const track = res.track;
+        if (!track) continue;
+
+        const idx = state.clips.findIndex(c => c.id === clipId);
+        if (idx !== -1) {
+          state.clips[idx] = { ...state.clips[idx], ...track };
+          saveClips();
+          renderClips();
+        }
+
+        if (track.status === 'complete' || track.status === 'error') break;
+      } catch (_e) {}
+    }
   }
 
-  $('dlInfo').onclick = async () => {
-    const u = dlUrlValue();
-    if (!u) return;
-    const box = $('dlMeta');
-    box.style.display = '';
-    box.textContent = 'sorgulanıyor…';
-    try {
-      const d = await api('/download/info?url=' + encodeURIComponent(u));
-      logLine('GET /download/info', d);
-      const kb = d.content_length ? (Number(d.content_length) / 1024 / 1024).toFixed(2) + ' MB' : 'bilinmiyor';
-      box.innerHTML = `
-        <div class="row2"><span>durum</span><b>${d.status}</b></div>
-        <div class="row2"><span>tür</span><b>${d.content_type || '—'}</b></div>
-        <div class="row2"><span>boyut</span><b>${kb}</b></div>
-        <div class="row2"><span>seek (Range)</span><b>${d.accept_ranges || 'yok'}</b></div>
-        <div class="row2"><span>dosya adı</span><b>${d.filename}</b></div>`;
-    } catch (err) {
-      box.textContent = 'Hata: ' + (err.code || '') + ' ' + err.message;
-      toast('Önizleme başarısız: ' + err.message, 'err');
+  function renderClips() {
+    const list = $('clipsList');
+    const empty = $('emptyClips');
+    if (!state.clips.length) {
+      empty.style.display = 'block';
+      list.innerHTML = '';
+      return;
     }
+
+    empty.style.display = 'none';
+    list.innerHTML = '';
+
+    state.clips.forEach(c => {
+      const el = document.createElement('div');
+      el.className = 'clip';
+      const isComplete = c.status === 'complete';
+      const dlUrl = withKey('/download?id=' + encodeURIComponent(c.id));
+      const streamUrl = withKey('/stream/' + encodeURIComponent(c.id));
+
+      el.innerHTML = `
+        <div class="clip-top">
+          <div style="flex:1">
+            <h3 class="clip-title">${escapeHtml(c.title || 'İsimsiz Beat')}</h3>
+            <div class="clip-meta">${escapeHtml(c.tags || c.prompt || '')}</div>
+          </div>
+          <span class="pill ${c.status}">${c.status}</span>
+        </div>
+        ${isComplete ? `<audio controls preload="none" src="${streamUrl}"></audio>` : ''}
+        <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+          ${isComplete ? `<a href="${dlUrl}" class="btn btn-primary btn-sm" download="${c.title || 'beat'}.mp3">⬇ MP3 İndir</a>` : ''}
+          <span class="mono" style="font-size:11px;color:var(--muted)">ID: ${c.id.slice(0, 14)}…</span>
+        </div>
+      `;
+      list.appendChild(el);
+    });
+  }
+
+  $('btnRefreshClips').onclick = () => {
+    state.clips.forEach(c => pollClip(c.id, 5));
+    toast('Klipler yenileniyor…');
   };
 
-  $('dlGo').onclick = async () => {
-    const u = dlUrlValue();
-    if (!u) return;
-    const btn = $('dlGo');
-    btn.disabled = true;
-    try {
-      // Bilinen dosya adini sunucuya ver (yoksa URL'den turetir)
-      let name = '';
-      if ($('dlMeta').style.display !== 'none') {
-        const m = $('dlMeta').querySelector('.row2:last-child b');
-        if (m) name = m.textContent;
-      }
-      const url = '/download?url=' + encodeURIComponent(u) + (name ? '&filename=' + encodeURIComponent(name) : '');
-      logLine('GET /download?url=…', u.slice(0, 120));
-      window.location.href = withKey(url);
-      toast('İndirme başlatıldı.');
-    } finally {
-      setTimeout(() => { btn.disabled = false; }, 1500);
-    }
-  };
-
-  $('generate').onclick = generate;
-  $('prompt').addEventListener('keydown', (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') generate();
-  });
-
-  $('refreshAll').onclick = () => state.clips.forEach((c) => pollClip(c.id, 59));
-  $('clearAll').onclick = () => {
+  $('btnClearClips').onclick = () => {
     state.clips = [];
     saveClips();
-    render();
-    toast('Liste temizlendi.');
+    renderClips();
   };
 
-  render();
+  // --- POOL TAB ---
+  async function loadPool() {
+    const tbody = $('poolTableBody');
+    try {
+      const res = await api('/auth/pool');
+      const pool = res.pool;
+      $('poolStatusCount').textContent = `${pool.availableAccounts} / ${pool.totalAccounts} Aktif`;
+
+      tbody.innerHTML = '';
+      pool.accounts.forEach(a => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td><b>${a.id}</b></td>
+          <td><span class="tag">${a.tokenType === 'refresh' ? 'SÜRESİZ (Refresh)' : 'Access'}</span></td>
+          <td>${a.isAvailable ? '<span style="color:var(--ok)">● Aktif</span>' : '<span style="color:var(--err)">● Tükendi / Beklemede</span>'}</td>
+          <td>${a.tokenExpiresInSeconds ? Math.round(a.tokenExpiresInSeconds / 60) + ' dk' : '—'}</td>
+          <td>${a.totalGenerated || 0}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+    } catch (e) {
+      tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--err);padding:20px">Havuz verisi alınamadı: ${e.message}</td></tr>`;
+    }
+  }
+
+  $('btnResetPoolLimits').onclick = async () => {
+    try {
+      await api('/auth/reset-limits', { method: 'POST' });
+      toast('Havuz sınırları sıfırlandı.', 'ok');
+      loadPool();
+    } catch (e) {
+      toast('Sıfırlanamadı: ' + e.message, 'err');
+    }
+  };
+
+  // --- URL DOWNLOADER ---
+  $('btnDlGo').onclick = () => {
+    const u = $('dlUrl').value.trim();
+    if (!u) return toast('Lütfen geçerli bir URL girin.', 'err');
+    window.location.href = withKey('/download?url=' + encodeURIComponent(u));
+    toast('İndirme başlatıldı.');
+  };
+
+  function saveClips() {
+    try { localStorage.setItem(LS_CLIPS, JSON.stringify(state.clips.slice(0, 30))); } catch (_e) {}
+  }
+
+  function escapeHtml(s) {
+    return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  async function refreshStatus() {
+    try {
+      const res = await api('/health');
+      $('statusDot').className = 'dot ok';
+      $('statusText').textContent = 'Sistem Aktif (v' + (res.version || '1.0') + ')';
+    } catch (_e) {
+      $('statusDot').className = 'dot err';
+      $('statusText').textContent = 'Bağlantı Yok';
+    }
+    loadPool();
+  }
+
+  // Init
+  if (state.apiKey) $('activeApiKey').value = state.apiKey;
+  loadKeys();
+  renderClips();
   refreshStatus();
-  setInterval(refreshStatus, 60000);
 })();
 </script>
 </body>
