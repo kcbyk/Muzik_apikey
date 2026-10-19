@@ -62,10 +62,13 @@ module.exports = {
           const isExhausted = ctx.isCreditExhaustedError && ctx.isCreditExhaustedError(err);
           const isAuthFailed =
             err.status === 401 ||
+            err.status === 422 ||
             err.isAuthError ||
             err.code === 'AUTH_ERROR' ||
             err.code === 'SESSION_EXPIRED' ||
-            /clerk oturumu bulunamadi|token reddi/i.test(String(err.message || err.detail || ''));
+            /clerk oturumu bulunamadi|token reddi|token_validation_failed/i.test(
+              String(err.message || err.detail || '')
+            );
 
           if (isExhausted || isAuthFailed) {
             creditExhausted = true;

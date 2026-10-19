@@ -2526,8 +2526,14 @@ async function fetchCreditsSafe() {
   try {
     const data = await sunoRequest('get', '/api/billing/info/');
     if (!data) return null;
+    const rateLimitAvail = data.credit_rate_limit ? data.credit_rate_limit.available_credits : null;
+    const totalAvail = typeof data.total_credits_left === 'number' ? data.total_credits_left : data.credits;
+    const effectiveCredits = rateLimitAvail !== null ? rateLimitAvail : totalAvail;
     return {
-      credits: data.credits,
+      credits: effectiveCredits,
+      raw_credits: data.credits,
+      total_credits_left: data.total_credits_left,
+      available_credits: rateLimitAvail,
       is_active: data.is_active,
       monthly_usage: data.monthly_usage,
       monthly_limit: data.monthly_limit,
