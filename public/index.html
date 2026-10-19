@@ -83,6 +83,24 @@
   .hint{font-size:11.5px;color:var(--muted);margin-top:7px}
   .hint b{color:#b9c6de;font-weight:600}
 
+  /* --- key creation --- */
+  .keyout{
+    display:flex;align-items:center;gap:8px;background:#0a0e15;border:1px solid var(--line);
+    border-radius:10px;padding:8px 10px;margin:8px 0;
+  }
+  .keyout code{flex:1;min-width:0;font-size:12px;color:#b9f5d0;word-break:break-all;font-family:ui-monospace,Menlo,monospace}
+  .keyrow{
+    display:flex;align-items:center;gap:8px;padding:9px 0;border-bottom:1px solid var(--line);
+    font-size:12.5px;
+  }
+  .keyrow:last-child{border-bottom:none}
+  .keyrow .kn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .keyrow .kp{color:var(--muted);font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+  .role{font-size:10px;padding:2px 7px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+  .role.admin{color:var(--accent);border-color:rgba(110,168,254,.4);background:rgba(110,168,254,.08)}
+  details.manage summary{cursor:pointer;font-size:12px;color:var(--muted);list-style:none;margin-top:12px}
+  details.manage summary::-webkit-details-marker{display:none}
+
   /* --- results --- */
   .results-head{display:flex;align-items:center;gap:10px;margin-bottom:14px}
   .results-head h2{margin:0}
@@ -157,6 +175,31 @@
         </div>
       </div>
 
+      <div class="card" style="margin-bottom:16px">
+        <h2>Anahtar Oluştur</h2>
+        <div class="field">
+          <label for="keyName">Anahtar adı</label>
+          <input type="text" id="keyName" placeholder="ör. telefon, demo, prod" />
+        </div>
+        <button class="btn btn-primary" id="createKey">＋ Yeni anahtar oluştur</button>
+
+        <div id="newKeyBox" style="display:none">
+          <div class="hint" style="margin-top:10px">⚠️ Bu anahtar <b>yalnızca bir kez</b> gösterilir — şimdi kopyala:</div>
+          <div class="keyout">
+            <code id="newKeyValue"></code>
+            <button class="btn btn-ghost btn-sm" id="copyKey">Kopyala</button>
+          </div>
+          <button class="btn btn-ghost btn-sm" id="useKey" style="width:100%">Bu anahtarı kullan</button>
+        </div>
+
+        <div class="hint">Anahtar üretmek için <b>yönetici</b> anahtarı gerekir (yukarıdaki alana gir ve kaydet). Hiç anahtar yoksa ilk üretim serbesttir.</div>
+
+        <details class="manage">
+          <summary>▸ Anahtarları yönet</summary>
+          <div id="keyList" style="margin-top:6px"></div>
+        </details>
+      </div>
+
       <div class="card">
         <h2>Yeni Beat</h2>
         <div class="field">
@@ -200,6 +243,7 @@
   </div>
 </div>
 
+<input type="hidden" id="newKey" />
 <div id="toast"></div>
 
 <script>
@@ -468,6 +512,112 @@
       logLine('✖ /providers', err.data || err.message);
       toast(err.status === 401 ? 'Anahtar geçersiz (401).' : 'Bağlantı hatası: ' + err.message, 'err');
     }
+    refreshStatus();
+  };
+
+  // ---------------------------------------------------------------------
+  //  Anahtar üretimi / yönetimi
+  // ---------------------------------------------------------------------
+  async function createKey() {
+    const name = $('keyName').value.trim();
+    const btn = $('createKey');
+    btn.disabled = true;
+    btn.textContent = '⏳ üretiliyor…';
+    try {
+      const data = await api('/keys', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      logLine('POST /keys', { ok: data.ok, record: data.record });
+      $('newKeyValue').textContent = data.key;
+      $('newKeyBox').style.display = '';
+      $('newKey').dataset.value = data.key;
+      $('keyName').value = '';
+      toast('Anahtar oluşturuldu — şimdi kopyala.', 'ok');
+      loadKeys();
+    } catch (err) {
+      logLine('✖ POST /keys', err.data || err.message);
+      toast(
+        err.status === 403
+          ? 'Yönetici anahtarı gerekli. Önce mevcut anahtarını gir.'
+          : err.status === 401
+            ? 'Geçerli bir anahtar gir (401).'
+            : 'Anahtar oluşturulamadı: ' + err.message,
+        'err',
+      );
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '＋ Yeni anahtar oluştur';
+    }
+  }
+
+  async function loadKeys() {
+    const box = $('keyList');
+    try {
+      const data = await api('/keys');
+      if (!data.keys.length) {
+        box.innerHTML = '<div class="hint">Kayıtlı anahtar yok.</div>';
+        return;
+      }
+      box.innerHTML = '';
+      data.keys.forEach((k) => {
+        const row = document.createElement('div');
+        row.className = 'keyrow';
+        row.innerHTML = `
+          <span class="kn"></span>
+          <span class="kp"></span>
+          <span class="role"></span>
+          <button class="btn btn-ghost btn-sm">iptal</button>`;
+        row.querySelector('.kn').textContent = k.name;
+        row.querySelector('.kp').textContent = k.prefix;
+        const role = row.querySelector('.role');
+        role.textContent = k.role;
+        if (k.role === 'admin') role.classList.add('admin');
+        const del = row.querySelector('button');
+        if (k.revoked) {
+          del.disabled = true;
+          del.textContent = 'iptal edildi';
+        }
+        del.onclick = async () => {
+          if (!confirm(`"${k.name}" anahtarı iptal edilsin mi?`)) return;
+          try {
+            await api('/keys/' + encodeURIComponent(k.id), { method: 'DELETE' });
+            toast('Anahtar iptal edildi.', 'ok');
+            loadKeys();
+          } catch (err) {
+            toast('İptal edilemedi: ' + err.message, 'err');
+          }
+        };
+        box.appendChild(row);
+      });
+    } catch (err) {
+      box.innerHTML = '';
+      const h = document.createElement('div');
+      h.className = 'hint';
+      h.textContent = err.status === 401 || err.status === 403
+        ? 'Listelemek için yönetici anahtarı gerekli.'
+        : 'Liste alınamadı: ' + err.message;
+      box.appendChild(h);
+    }
+  }
+
+  $('createKey').onclick = createKey;
+  $('copyKey').onclick = async () => {
+    const v = $('newKey').dataset.value || '';
+    try {
+      await navigator.clipboard.writeText(v);
+      toast('Kopyalandı.', 'ok');
+    } catch (_e) {
+      toast('Kopyalanamadı — metni seçip elle kopyala.', 'err');
+    }
+  };
+  $('useKey').onclick = () => {
+    const v = $('newKey').dataset.value || '';
+    $('apiKey').value = v;
+    state.apiKey = v;
+    localStorage.setItem(LS_KEY, v);
+    toast('Anahtar kullanıma alındı.', 'ok');
     refreshStatus();
   };
 

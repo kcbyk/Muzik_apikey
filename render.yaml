@@ -36,10 +36,17 @@ services:
         value: "true"
       - key: SIGNER_POOL_ENABLED
         value: "true"
+      # Siteden uretilen anahtarlar (ucretsiz planda kalici degil).
+      # Kalici kayit icin Render Disk ekleyip /data/keys.json verin.
+      - key: KEY_STORE_FILE
+        value: /tmp/keys.json
 
       # --- Sir olarak panelden girilecek (sync: false) ---
       - key: SUNO_REFRESH_TOKEN
         sync: false
       # x-api-key / ?api_key= ile eslesecek anahtar listesi
       - key: ALLOWED_API_KEYS
+        sync: false
+      # Opsiyonel master anahtar (panelden)
+      - key: ADMIN_KEY
         sync: false

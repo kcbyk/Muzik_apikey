@@ -32,7 +32,10 @@ npm start
 
 | Metot | Yol | Açıklama |
 |---|---|---|
-| `GET` | `/` | **Web Dashboard** (`public/index.html`) — üret, dinle, indir |
+| `GET` | `/` | **Web Dashboard** (`public/index.html`) — üret, dinle, indir, anahtar oluştur |
+| `POST` | `/keys` | **Siteden API anahtarı üretir** (yanıtta 1 kez gösterilir) |
+| `GET` | `/keys` | Anahtar listesi (maskeli: `sk_49ZoP…`) |
+| `DELETE` | `/keys/:id` | Anahtarı iptal eder (anında `401`) |
 | `GET` | `/ping` | UptimeRobot için `pong` (auth istemez, en hafif endpoint) |
 | `GET` | `/health` | Uptime, bellek, token TTL, son hata |
 | `POST` | `/auth/refresh` | Token'i manuel yeniler (kurtarma/debug) |
@@ -1082,3 +1085,65 @@ git push -u origin main
 | `GET /download?id=&api_key=` | `200`, **529 244 B** |
 | `GET /track/:id` anahtarsız / anahtarlı | `401` / `200` + `complete` |
 | `GET /providers` yanlış / doğru | `401` / `200` |
+
+---
+
+## 20. 🔑 Siteden API anahtarı oluşturma
+
+### 20.1 Akış
+
+```
+Dashboard → "Anahtar Oluştur" → POST /keys → sk_… (yalnızca 1 kez gösterilir)
+                                          → "Bu anahtarı kullan" → localStorage
+                                          → tüm isteklerde x-api-key / ?api_key=
+```
+
+### 20.2 Güvenlik modeli
+
+- **Anahtar saklanmaz:** depoda yalnızca `SHA-256` özeti + görünen önek (`sk_49ZoP…`).
+  Depo ele geçse bile anahtarlar geri üretilemez.
+- **Format:** `sk_` + 32 bayt base64url (~256 bit entropi).
+- **Roller:**
+  - `admin` → anahtar üretebilir/iptal edebilir. `.env` anahtarları ve `ADMIN_KEY` her zaman admin.
+  - `client` → yalnızca API kullanır; `POST /keys` → **403**.
+- **Bootstrap:** hiç anahtar yoksa ilk üretim serbesttir ve o anahtar `admin` olur.
+  Sonrasında üretim için geçerli bir admin anahtarı gerekir (401/403).
+- **İptal:** `DELETE /keys/:id` → anahtar aynı saniyede geçersiz (`401`).
+
+### 20.3 Uçlar
+
+```bash
+# Üret (admin anahtarı ile)
+curl -X POST https://.../keys -H "x-api-key: <ADMIN>" \
+     -H 'content-type: application/json' -d '{"name":"telefon"}'
+# -> {"ok":true,"key":"sk_…","warning":"Bu anahtar yalnizca BIR KEZ gosterilir…","record":{…}}
+
+# Listele (maskeli)
+curl https://.../keys -H "x-api-key: <ADMIN>"
+
+# İptal
+curl -X DELETE https://.../keys/<id> -H "x-api-key: <ADMIN>"
+```
+
+### 20.4 Kalıcılık
+
+`KEY_STORE_FILE` boşsa anahtarlar **bellekte** tutulur (process ölünce gider).
+Dosya verilirse JSON'a yazılır (0600, atomik rename).
+Render ücretsiz planda disk geçicidir: restart'ta kalır, **yeni deploy'da sıfırlanır**.
+Kalıcı kayıt için Render Disk + `KEY_STORE_FILE=/data/keys.json`.
+
+> Anahtarlar sıfırlansa bile `.env`'deki `ALLOWED_API_KEYS` anahtarı her zaman
+> admin olarak çalıştığı için siteden yenisi üretilebilir — kilitlenme olmaz.
+
+### 20.5 Doğrulama (ölçüldü)
+
+| Test | Sonuç |
+|---|---|
+| `POST /keys` (admin) | `201`, `role: client` |
+| Üretilen anahtar + `/generate-beat` | `200` |
+| Üretilen anahtar + `GET /keys` | **`403 FORBIDDEN`** (client) |
+| Üretilen anahtar + `POST /keys` | **`403`** |
+| `DELETE /keys/:id` → eski anahtar | **`401`** |
+| Bootstrap (hiç anahtar yok) | `201`, `role: admin` |
+| Bootstrap sonrası anahtarsız istek | `401` |
+| Diskte saklanan | yalnızca `hash` + `prefix` |

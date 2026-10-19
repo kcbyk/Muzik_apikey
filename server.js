@@ -38,6 +38,7 @@ const providerRegistry = require('./providers');
 // Imza motoru + token cache havuzu (request 12)
 const signer = require('./utils/signer');
 const { SignerPool } = require('./utils/signerPool');
+const { KeyStore } = require('./utils/keyStore');
 
 // ============================================================================
 // 1. KONFIGURASYON
@@ -74,6 +75,14 @@ const CONFIG = {
   apiKeyRequired: envBool(process.env.API_KEY_REQUIRED, false),
   // Public dashboard dizini
   publicDir: path.join(__dirname, 'public'),
+  // --- Siteden anahtar uretimi (utils/keyStore.js) ---
+  keyStoreEnabled: envBool(process.env.KEY_STORE_ENABLED, true),
+  // JSON dosyasi ('' -> yalnizca bellek). Ornek: /data/keys.json
+  keyStoreFile: (process.env.KEY_STORE_FILE || '').trim(),
+  keyStoreMax: envInt(process.env.KEY_STORE_MAX, 200),
+  // Opsiyonel master anahtar: hem normal API anahtari hem "anahtar uretme"
+  // yetkisi verir. ALLOWED_API_KEYS doluysa zorunlu degildir.
+  adminKey: (process.env.ADMIN_KEY || '').trim(),
 
   // --- Suno Studio API ---
   // NOT: "studio-api.suno.ai" alan adi 2026 itibariyle 503 donduruyor.
@@ -2067,6 +2076,13 @@ function safeKeyEqual(a, b) {
   }
 }
 
+/** Calisma aninda uretilen anahtarlarin deposu (utils/keyStore.js). */
+const keyStore = new KeyStore({
+  enabled: CONFIG.keyStoreEnabled,
+  file: CONFIG.keyStoreFile,
+  maxKeys: CONFIG.keyStoreMax,
+});
+
 /**
  * PROJE GENELI API ANAHTARI KORUMASI
  * ----------------------------------
@@ -2082,37 +2098,73 @@ function safeKeyEqual(a, b) {
  */
 function apiKeyGuard(req, res, next) {
   const configured = CONFIG.allowedApiKeys;
+  const bearer = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
+  const provided = String(req.get('x-api-key') || (req.query && req.query.api_key) || bearer || '').trim();
 
-  if (!configured.length) {
+  const hasAnyKey = configured.length > 0 || Boolean(CONFIG.adminKey) || keyStore.activeCount() > 0;
+
+  // --- Hic anahtar tanimli degil ---
+  if (!hasAnyKey) {
     if (CONFIG.apiKeyRequired) {
       return sendError(
         res,
         401,
         'UNAUTHORIZED',
-        'Sunucuda API anahtari tanimli degil (ALLOWED_API_KEYS) ve siki mod acik.',
+        'Sunucuda API anahtari yok. Panelden bir anahtar uretin (POST /keys).',
       );
     }
+    req.apiKeyRole = 'open';
+    req.apiKeySource = 'none';
     return next();
   }
-
-  const bearer = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
-  const provided = String(req.get('x-api-key') || (req.query && req.query.api_key) || bearer || '').trim();
 
   if (!provided) {
     return sendError(res, 401, 'UNAUTHORIZED', 'API anahtari gerekli (x-api-key veya ?api_key=).');
   }
 
-  const ok = configured.some((key) => safeKeyEqual(key, provided));
-  if (!ok) {
-    log('warn', 'Gecersiz API anahtari.', {
-      ip: req.ip,
-      path: req.path,
-      keyPrefix: `${provided.slice(0, 4)}…`,
-    });
-    return sendError(res, 401, 'UNAUTHORIZED', 'Gecersiz API anahtari.');
+  // 1) Master anahtar (ADMIN_KEY): hem erisim hem anahtar uretme yetkisi
+  if (CONFIG.adminKey && safeKeyEqual(CONFIG.adminKey, provided)) {
+    req.apiKeyRole = 'admin';
+    req.apiKeySource = 'admin_key';
+    return next();
   }
 
-  return next();
+  // 2) .env'deki statik anahtarlar (yonetici sayilir)
+  if (configured.some((key) => safeKeyEqual(key, provided))) {
+    req.apiKeyRole = 'admin';
+    req.apiKeySource = 'env';
+    return next();
+  }
+
+  // 3) Siteden uretilen anahtarlar
+  const record = keyStore.verify(provided);
+  if (record) {
+    req.apiKeyRole = record.role;
+    req.apiKeySource = 'store';
+    req.apiKeyId = record.id;
+    return next();
+  }
+
+  log('warn', 'Gecersiz API anahtari.', {
+    ip: req.ip,
+    path: req.path,
+    keyPrefix: `${provided.slice(0, 6)}…`,
+  });
+  return sendError(res, 401, 'UNAUTHORIZED', 'Gecersiz API anahtari.');
+}
+
+/** Anahtar uretme/iptal yetkisi. Bootstrap (hic anahtar yokken) serbesttir. */
+function requireKeyAdmin(req, res) {
+  const bootstrap = CONFIG.allowedApiKeys.length === 0 && !CONFIG.adminKey && keyStore.activeCount() === 0;
+  if (bootstrap) return true;
+  if (req.apiKeyRole === 'admin') return true;
+  sendError(
+    res,
+    403,
+    'FORBIDDEN',
+    'Bu islem yonetici anahtari gerektirir (ALLOWED_API_KEYS veya ADMIN_KEY).',
+  );
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2164,9 +2216,12 @@ app.get('/health', (_req, res) => {
       lastError: handshakeState.lastError,
     },
     security: {
-      apiKeyRequired: CONFIG.allowedApiKeys.length > 0 || CONFIG.apiKeyRequired,
+      apiKeyRequired:
+        CONFIG.allowedApiKeys.length > 0 || Boolean(CONFIG.adminKey) || keyStore.activeCount() > 0,
       allowedApiKeys: CONFIG.allowedApiKeys.length,
+      adminKeyConfigured: Boolean(CONFIG.adminKey),
       dashboard: Boolean(CONFIG.publicDir),
+      keyStore: keyStore.stats_(),
     },
     signer: signerStatus(),
     config: {
@@ -3175,6 +3230,78 @@ app.get('/debug/tls', apiKeyGuard, async (req, res) => {
   }
 });
 
+
+// ---------------------------------------------------------------------------
+// API ANAHTARI YONETIMI  (siteden anahtar uretimi)
+// ---------------------------------------------------------------------------
+//  GET    /keys          -> anahtar listesi (maskeli; tam anahtar ASLA donmez)
+//  POST   /keys          -> yeni anahtar uretir  { "name": "telefon" }
+//                           Yanitta anahtar YALNIZCA BIR KEZ doner.
+//  DELETE /keys/:id      -> anahtari iptal eder
+//  POST   /keys/:id/revoke
+//
+//  YETKI
+//  -----
+//    - .env anahtarlari (ALLOWED_API_KEYS) ve ADMIN_KEY  -> yonetici
+//    - siteden uretilen "admin" anahtarlar               -> yonetici
+//    - siteden uretilen "client" anahtarlar              -> uretemez (403)
+//    - hic anahtar yoksa ilk uretim serbesttir (bootstrap)
+// ---------------------------------------------------------------------------
+app.get('/keys', apiKeyGuard, (req, res) => {
+  if (!requireKeyAdmin(req, res)) return undefined;
+  return res.json({
+    ok: true,
+    keys: keyStore.list(),
+    store: keyStore.stats_(),
+  });
+});
+
+app.post('/keys', apiKeyGuard, (req, res) => {
+  if (!requireKeyAdmin(req, res)) return undefined;
+
+  const body = req.body || {};
+  const name = String(body.name || '').trim();
+
+  // Bootstrap: baska yonetici kaynagi yoksa ilk anahtar admin olur,
+  // aksi halde uretilen anahtarlar "client" (baska anahtar uretemez).
+  const hasAdminSource =
+    CONFIG.allowedApiKeys.length > 0 ||
+    Boolean(CONFIG.adminKey) ||
+    keyStore.list().some((k) => k.role === 'admin' && !k.revoked);
+
+  try {
+    const { record, key } = keyStore.create(name, hasAdminSource ? 'client' : 'admin');
+    log('info', 'Yeni API anahtari uretildi.', { id: record.id, name: record.name, role: record.role });
+    return res.status(201).json({
+      ok: true,
+      key,
+      warning: 'Bu anahtar yalnizca BIR KEZ gosterilir. Simdi kopyalayin.',
+      record,
+      store: keyStore.stats_(),
+    });
+  } catch (err) {
+    const status = err.code === 'KEY_LIMIT_REACHED' ? 409 : err.code === 'KEY_STORE_DISABLED' ? 503 : 500;
+    return sendError(res, status, err.code || 'KEY_CREATE_FAILED', 'Anahtar uretilemedi.', err.message);
+  }
+});
+
+app.delete('/keys/:id', apiKeyGuard, (req, res) => {
+  if (!requireKeyAdmin(req, res)) return undefined;
+  const id = String(req.params.id || '').trim();
+  const removed = keyStore.remove(id);
+  if (!removed) return sendError(res, 404, 'KEY_NOT_FOUND', `Anahtar bulunamadi: ${id}`);
+  log('info', 'API anahtari iptal edildi.', { id });
+  return res.json({ ok: true, revoked: true, id, store: keyStore.stats_() });
+});
+
+app.post('/keys/:id/revoke', apiKeyGuard, (req, res) => {
+  if (!requireKeyAdmin(req, res)) return undefined;
+  const id = String(req.params.id || '').trim();
+  const ok = keyStore.revoke(id);
+  if (!ok) return sendError(res, 404, 'KEY_NOT_FOUND', `Anahtar bulunamadi: ${id}`);
+  return res.json({ ok: true, revoked: true, id, store: keyStore.stats_() });
+});
+
 // ---------------------------------------------------------------------------
 // WEB DASHBOARD  (public/ -> http://host/)
 // ---------------------------------------------------------------------------
@@ -3248,10 +3375,14 @@ const server = app.listen(CONFIG.port, '0.0.0.0', () => {
   log('info', `Suno Beat Proxy dinleniyor: http://0.0.0.0:${CONFIG.port}`);
   log('info', `Suno API: ${CONFIG.sunoApiBase}${CONFIG.generatePath}`);
   log('info', `Clerk: ${CONFIG.clerkBaseUrl} (js v${CONFIG.clerkJsVersion})`);
-  if (!CONFIG.allowedApiKeys.length) {
-    log('warn', 'ALLOWED_API_KEYS bos -> API korumasi KAPALI. Production icin doldurun.');
+  if (!CONFIG.allowedApiKeys.length && !CONFIG.adminKey && keyStore.activeCount() === 0) {
+    log('warn', 'Hic API anahtari yok -> koruma KAPALI. Panelden anahtar uretin (POST /keys).');
   } else {
-    log('info', 'API anahtari korumasi aktif.', { keys: CONFIG.allowedApiKeys.length });
+    log('info', 'API anahtari korumasi aktif.', {
+      envKeys: CONFIG.allowedApiKeys.length,
+      adminKey: Boolean(CONFIG.adminKey),
+      storeKeys: keyStore.activeCount(),
+    });
   }
   startKeepAlive();
 });
