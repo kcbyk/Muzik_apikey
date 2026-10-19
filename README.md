@@ -1553,3 +1553,65 @@ Token: https://replicate.com/account/api-tokens
 
 Replicate hesabında bakiye yok. Kredi yüklenince aynı akış çalışır:
 https://replicate.com/account/billing (min. $5; MusicGen ~$0.03–0.10/parça).
+
+---
+
+## 29. 🎼 Google Lyria sağlayıcısı (resmî API, DRM yok)
+
+### 29.1 Neden
+
+Google, Lyria 3.5'i **Gemini API** üzerinden açtı (4 Eylül 2026). Cevap
+**base64 MP3** olarak geliyor — presigned URL yok, indirme kilidi yok, DRM yok.
+Bu yüzden dosyayı kendi indirme sistemimizden servis ediyoruz.
+
+| Model | Süre | Not |
+|---|---|---|
+| `lyria-3-clip-preview` | sabit 30 sn | hızlı, test için ideal |
+| `lyria-3.5` | ~2-3 dk tam şarkı | vokal + lirik |
+
+### 29.2 Kurulum
+
+```env
+AUDIO_PROVIDER=google
+GEMINI_API_KEY=...                        # https://aistudio.google.com/apikey
+GEMINI_MUSIC_MODEL=lyria-3-clip-preview   # veya lyria-3.5
+GOOGLE_AUDIO_TTL_MINUTES=60
+GOOGLE_AUDIO_MAX_CLIPS=6
+```
+
+### 29.3 Akış
+
+```text
+POST /generate-beat
+  → POST https://generativelanguage.googleapis.com/v1beta/interactions
+    { model, input }  + x-goog-api-key
+  → { output_audio: { data: "<base64 mp3>", mime_type } }
+  → Buffer olarak RAM'e alınır (TTL + adet sınırı)
+GET /track/:id  → complete, download_url: /download?id=…
+GET /download?id=…  → 200 audio/mpeg  (X-Download-Mode: memory)
+Range: bytes=0-1023 → 206
+GET /stream/:id → 200 inline audio/mpeg
+```
+
+### 29.4 Bellek davranışı (Render 512 MB)
+
+| Ayar | Varsayılan | Etki |
+|---|---|---|
+| `GOOGLE_AUDIO_MAX_CLIPS` | 6 | Aynı anda RAM'de tutulan klip |
+| `GOOGLE_AUDIO_TTL_MINUTES` | 60 | Sonrası otomatik silinir |
+
+30 sn'lik bir MP3 ≈ 0.5 MB → 6 klip ≈ 3 MB. Bütçe rahat.
+
+### 29.5 Ölçüm (Lyria cevabı taklit edilerek, uçtan uca)
+
+| Test | Sonuç |
+|---|---|
+| `POST /generate-beat` | ✅ `complete`, `download_url` hazır |
+| `GET /download?id=…` | ✅ `200`, 524 291 B, `audio/mpeg` |
+| `Range: bytes=0-1023` | ✅ `206`, 1 024 B |
+| `GET /stream/:id` | ✅ `200`, `audio/mpeg` |
+
+### 29.6 Maliyet
+
+Lyria 3.5 ≈ **$0.08 / şarkı** (Gemini API fiyatlandırması). Anahtar:
+https://aistudio.google.com/apikey

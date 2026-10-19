@@ -2291,6 +2291,51 @@ async function fetchCreditsSafe() {
   }
 }
 
+/**
+ * BELLEKTEKI SES BAYTLARINI SERVIS ET
+ * -----------------------------------
+ * Bazi saglayicilar (orn. Google Lyria) sesi base64 olarak dondurur; disarida
+ * bir URL yoktur. Bu durumda baytlari dogrudan kendi indirme sistemimizden
+ * veriyoruz. Range destegi korunur (tarayicida sarma/seek calissin diye).
+ *
+ * @returns {boolean} true = cevap gonderildi, route bitmeli
+ */
+function sendAudioBuffer(req, res, { buffer, mime, filename }, { inline = false } = {}) {
+  const total = buffer.length;
+  const range = req.headers.range || req.headers.Range;
+
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Content-Type', mime || 'audio/mpeg');
+  res.setHeader(
+    'Content-Disposition',
+    `${inline ? 'inline' : 'attachment'}; filename="${String(filename || 'beat.mp3').replace(/"/g, '')}"`,
+  );
+  res.setHeader('Cache-Control', 'private, max-age=0, no-transform');
+  res.setHeader('X-Download-Mode', 'memory');
+
+  if (range) {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(String(range).trim());
+    if (m) {
+      const start = m[1] ? parseInt(m[1], 10) : 0;
+      const end = m[2] ? Math.min(parseInt(m[2], 10), total - 1) : total - 1;
+      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= total) {
+        res.status(416).setHeader('Content-Range', `bytes */${total}`);
+        return res.end(), true;
+      }
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+      res.setHeader('Content-Length', String(end - start + 1));
+      res.end(buffer.subarray(start, end + 1));
+      return true;
+    }
+  }
+
+  res.status(200);
+  res.setHeader('Content-Length', String(total));
+  res.end(buffer);
+  return true;
+}
+
 /** Calisma aninda uretilen anahtarlarin deposu (utils/keyStore.js). */
 const keyStore = new KeyStore({
   enabled: CONFIG.keyStoreEnabled,
@@ -2885,6 +2930,17 @@ app.get('/download', apiKeyGuard, async (req, res) => {
 
       const provider = activeProvider();
 
+      // --- (A0) BELLEK DEPOSU: saglayici sesi bayt olarak verdiyse (orn. Google Lyria)
+      // disarida URL yok; dogrudan kendi indirme sistemimizden servis ederiz.
+      if (typeof provider.getAudioBuffer === 'function') {
+        const ab = await provider.getAudioBuffer(clipId);
+        if (ab && ab.buffer && ab.buffer.length) {
+          const fname = suggestedName || ab.filename || `${clipId}.mp3`;
+          log('info', 'Bellek deposundan servis edildi.', { clipId, bytes: ab.buffer.length, format });
+          return sendAudioBuffer(req, res, { buffer: ab.buffer, mime: ab.mime, filename: fname }, { inline });
+        }
+      }
+
       // Suno'ya ozgu handshake (varsa)
       if (typeof provider.beforeStream === 'function') {
         const hs = await provider.beforeStream(clipId);
@@ -3026,6 +3082,14 @@ app.get('/stream/:id', apiKeyGuard, async (req, res) => {
 
     const provider = activeProvider();
     const providerName = providerRegistry.getProviderName();
+
+    // --- Bellek deposu (Google Lyria gibi saglayicilar) ---
+    if (typeof provider.getAudioBuffer === 'function') {
+      const ab = await provider.getAudioBuffer(clipId);
+      if (ab && ab.buffer && ab.buffer.length) {
+        return sendAudioBuffer(req, res, { buffer: ab.buffer, mime: ab.mime, filename: ab.filename }, { inline: true });
+      }
+    }
 
     // --- Suno'ya ozgu handshake (diger saglayicilarda no-op) ---
     let handshakeSessionId = null;
