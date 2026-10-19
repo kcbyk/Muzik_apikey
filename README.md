@@ -1497,3 +1497,48 @@ tekrar: her 15 dakikada bir
 `is_download_unlocked: false` → `/download` = `409 CLIP_ENCRYPTED`.
 Bu **Suno'nun plan kısıtı**; proxy bayt üretmez/açmaz. Pro planda bayrak
 `true` olur ve aynı akış otomatik indirir (Pro hesapta ölçüldü: 3 764 184 B).
+
+---
+
+## 28. 🎛️ Replicate sağlayıcısı (Suno'suz üretim + indirme)
+
+### 28.1 Neden
+
+Suno free planda `audio_url = /api/forbidden` döndürüyor; klibin düz dosyası
+hiçbir yerde yok. Replicate'te çıktı **doğrudan indirilebilir bir URL**
+(`replicate.delivery`) olarak gelir — kendi indirme sistemimiz onu akıtır.
+
+### 28.2 Kurulum
+
+```env
+AUDIO_PROVIDER=replicate
+REPLICATE_API_TOKEN=r8_...
+REPLICATE_MODEL=meta/musicgen        # veya başka müzik modeli
+REPLICATE_DURATION=30
+```
+
+### 28.3 Akış (Suno ile birebir aynı uçlar)
+
+```text
+POST /generate-beat  -> { clip_ids:[prediction_id] }
+GET  /track/:id      -> status: queued|processing|complete, audio_url: https://replicate.delivery/…
+GET  /download?id=…  -> sağlayıcıdan ses URL'si çözülür -> proxy baytları akıtır
+GET  /download?url=… -> herhangi bir düz URL
+```
+
+### 28.4 Yapılan değişiklikler
+
+- `DOWNLOAD_ALLOWED_HOSTS` varsayılanına `replicate.delivery`,
+  `pbxt.replicate.delivery` eklendi.
+- 401 hataları sağlayıcıya göre ayrıştırıldı: `SUNO_AUTH_FAILED` yerine
+  `PROVIDER_AUTH_FAILED`.
+- 422 → `OUT_OF_CREDITS` teşhisi yalnızca `suno` sağlayıcısında çalışır.
+
+### 28.5 Maliyet
+
+| Model | Yaklaşık |
+|---|---|
+| `meta/musicgen` (Replicate) | ~$0.03–0.10 / parça |
+| `stability-ai/stable-audio-2.5` | ~$0.20 / parça |
+
+Token: https://replicate.com/account/api-tokens

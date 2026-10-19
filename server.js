@@ -130,7 +130,7 @@ const CONFIG = {
   // Yalnizca bu host'lardan akis yapilir. "*" KULLANMAYIN.
   downloadAllowedHosts: (
     process.env.DOWNLOAD_ALLOWED_HOSTS ||
-    'audiopipe.suno.ai,cdn1.suno.ai,cdn2.suno.ai,cdn.suno.ai,studio-api-prod.suno.com,studio-api.prod.suno.com,suno-data-uploads.s3.amazonaws.com'
+    'audiopipe.suno.ai,cdn1.suno.ai,cdn2.suno.ai,cdn.suno.ai,studio-api-prod.suno.com,studio-api.prod.suno.com,suno-data-uploads.s3.amazonaws.com,replicate.delivery,pbxt.replicate.delivery'
   )
     .split(',')
     .map((h) => h.trim().toLowerCase())
@@ -2675,18 +2675,29 @@ app.post('/generate-beat', apiKeyGuard, async (req, res) => {
       return sendError(res, 429, 'RATE_LIMITED', 'Istek limiti asildi, biraz sonra tekrar deneyin.', err.detail);
     }
     if (status === 401) {
+      // Saglayiciya gore mesaj: suno'da JWT, digerlerinde API token.
+      if (providerRegistry.getProviderName() === 'suno') {
+        return sendError(
+          res,
+          502,
+          'SUNO_AUTH_FAILED',
+          'Suno token reddetti (401). Taze JWT gerekli: POST /auth/token.',
+          err.detail,
+        );
+      }
       return sendError(
         res,
         502,
-        'SUNO_AUTH_FAILED',
-        'Suno token reddetti (401). Taze JWT gerekli: POST /auth/token.',
+        'PROVIDER_AUTH_FAILED',
+        'Saglayici kimlik bilgisini reddetti (401). API token gecerli mi?',
         err.detail,
       );
     }
     if (status === 503) {
       return sendError(res, 503, err.code || 'PROVIDER_NOT_CONFIGURED', err.message, err.detail);
     }
-    if (status === 422 || /token_validation_failed/i.test(String(err.detail || ''))) {
+    const isSuno = providerRegistry.getProviderName() === 'suno';
+    if (isSuno && (status === 422 || /token_validation_failed/i.test(String(err.detail || '')))) {
       // Suno 422'yi hem "token gecersiz" hem "kredin bitti" icin donduruyor.
       // Gercek sebebi olcelim: bakiye sifirsa bunu acikca soyle.
       const credits = await fetchCreditsSafe();
