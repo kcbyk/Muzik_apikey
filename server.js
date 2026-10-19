@@ -2066,16 +2066,44 @@ const activeProvider = () => providerRegistry.getProvider();
  */
 async function fetchSunoDownloadUrl(clipId, format = 'mp3') {
   const fmt = ['mp3', 'wav'].includes(String(format).toLowerCase()) ? String(format).toLowerCase() : 'mp3';
-  const data = await sunoRequest('get', `/api/download/clip/${encodeURIComponent(clipId)}?format=${fmt}`);
+
+  const cached = cacheGetDownloadUrl(clipId, fmt);
+  if (cached) {
+    if (!cached.url) {
+      // onbellekteki olumsuz sonuc: cagirana sebebi ile birlikte bildir
+      const err = new HttpError(409, 'DOWNLOAD_NOT_AUTHORIZED', 'Suno bu klip icin indirme izni vermedi.', cached.reason);
+      throw err;
+    }
+    return { url: cached.url, status: cached.status || 'ready', format: fmt, cached: true };
+  }
+
+  let data = null;
+  try {
+    data = await sunoRequest('get', `/api/download/clip/${encodeURIComponent(clipId)}?format=${fmt}`);
+  } catch (err) {
+    // 403/404 gibi durumlar -> indirme hakki yok
+    cachePutDownloadUrl(clipId, fmt, { url: null, reason: sanitizeMessage(err.message) });
+    throw err;
+  }
+
   const url = data && (data.download_url || data.url);
-  if (!url) return null;
+  if (!url || (data && data.ok === false)) {
+    const reason = (data && (data.reason || data.message)) || 'download_url yok';
+    cachePutDownloadUrl(clipId, fmt, { url: null, reason });
+    log('info', 'Indirme izni yok.', { clipId, reason });
+    return null;
+  }
 
   const check = isAllowedDownloadUrl(url);
   if (!check.ok) {
     log('warn', 'Indirme URL\'si allowlist disinda.', check.reason);
+    cachePutDownloadUrl(clipId, fmt, { url: null, reason: check.reason });
     return null;
   }
-  return { url: check.url, status: (data && data.status) || 'ready', format: fmt };
+
+  const status = (data && data.status) || 'ready';
+  cachePutDownloadUrl(clipId, fmt, { url: check.url, status });
+  return { url: check.url, status, format: fmt };
 }
 
 providerRegistry.providers.suno.init({
@@ -2187,6 +2215,42 @@ function safeKeyEqual(a, b) {
   } catch (_e) {
     return false;
   }
+}
+
+/**
+ * PRESIGNED INDIRME URL ONBELLEGI
+ * -------------------------------
+ * Suno /api/download/clip/:id her cagrida yeni bir presigned S3 linki uretir
+ * (~5 dk omurlu). Ayni klip icin tekrar tekrar istememek uzere kisa TTL'li
+ * bellek onbellegi tutuyoruz. Negatif sonuc (not_authorized) da kisaca
+ * onbelleklenir ki her indirme denemesinde Suno'ya gidilmesin.
+ */
+const downloadUrlCache = new Map(); // clipId -> { url|null, expiresAt, reason, status }
+const DOWNLOAD_URL_TTL_MS = 4 * 60 * 1000;      // pozitif: 4 dk
+const DOWNLOAD_URL_NEG_TTL_MS = 60 * 1000;      // negatif: 1 dk
+
+function cacheGetDownloadUrl(clipId, format = 'mp3') {
+  const key = `${clipId}:${format}`;
+  const hit = downloadUrlCache.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt <= Date.now()) {
+    downloadUrlCache.delete(key);
+    return null;
+  }
+  return hit;
+}
+
+function cachePutDownloadUrl(clipId, format, value) {
+  const key = `${clipId}:${format}`;
+  // LRU: 300 kayit siniri
+  if (downloadUrlCache.size >= 300) {
+    const oldest = downloadUrlCache.keys().next().value;
+    if (oldest) downloadUrlCache.delete(oldest);
+  }
+  downloadUrlCache.set(key, {
+    ...value,
+    expiresAt: Date.now() + (value.url ? DOWNLOAD_URL_TTL_MS : DOWNLOAD_URL_NEG_TTL_MS),
+  });
 }
 
 /** Calisma aninda uretilen anahtarlarin deposu (utils/keyStore.js). */
@@ -2619,6 +2683,7 @@ app.get('/clips', apiKeyGuard, async (req, res) => {
 //  Ornek:  GET /track/afaea7cd-244b-4b00-9a5b-93152f74d285?wait=true
 // ---------------------------------------------------------------------------
 app.get('/track/:id', apiKeyGuard, async (req, res) => {
+  // NOT: asagida klip tamamsa otomatik indirme URL'si cozulur (auto-download).
   try {
     const clipId = String(req.params.id || '').trim();
     if (!/^[A-Za-z0-9_-]{8,64}$/.test(clipId)) {
@@ -2654,10 +2719,38 @@ app.get('/track/:id', apiKeyGuard, async (req, res) => {
       timedOut = !(track.is_complete || track.is_error);
     }
 
+    // --- AUTO-DOWNLOAD: klip tamamsa indirme URL'sini SIMDI coz ---
+    // Dashboard bunu gorunce "Indir" butonu hazir olur; ayri bir cagri gerekmez.
+    let download = { ready: false };
+    if (track.is_complete && typeof provider.getDownloadSource === 'function') {
+      try {
+        const dl = await provider.getDownloadSource(clipId, 'mp3');
+        download = dl && dl.url
+          ? {
+              ready: true,
+              mode: 'official-api',
+              format: dl.format || 'mp3',
+              // Istemci bu yolu kullanir; presigned link sizmaz.
+              proxy_path: `/download?id=${encodeURIComponent(clipId)}`,
+              stream_path: `/stream/${encodeURIComponent(clipId)}`,
+            }
+          : { ready: false, reason: 'download_not_authorized' };
+      } catch (dlErr) {
+        download = {
+          ready: false,
+          reason: dlErr.code || 'download_not_authorized',
+          detail: sanitizeMessage(dlErr.detail || dlErr.message),
+        };
+      }
+    } else if (track.is_complete) {
+      download = { ready: false, reason: 'provider_has_no_download_api' };
+    }
+
     return res.json({
       ok: true,
       provider: providerName,
       track,
+      download,
       waited,
       wait_timed_out: timedOut,
       ...(req.query.raw === '1' ? { raw: track } : {}),

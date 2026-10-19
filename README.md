@@ -1245,3 +1245,47 @@ DOWNLOAD_ALLOWED_HOSTS=suno-data-uploads.s3.amazonaws.com,cdn.ornek.com
 > Bu servis **bayt aktarımı** yapar. Erişim izni olmayan / şifreli bir kaynağı
 > "açma" iddiası yoktur: kaynak ne döndürüyorsa onu iletir. Suno'nun
 > `not_authorized` cevabı bir erişim kısıtıdır ve proxy tarafında aşılamaz.
+
+---
+
+## 23. ⚡ Otomatik indirme akışı (0 tık)
+
+### 23.1 Nasıl çalışıyor
+
+```
+POST /generate-beat          -> klip(lar) submitted
+GET  /track/:id  (poll)      -> klip "complete" olunca SUNUCU indirme URL'sini çözer
+                                yanıta `download` bloğu eklenir:
+                                { ready:true, mode:"official-api", proxy_path:"/download?id=…" }
+Dashboard                    -> "İndir" butonu HAZIR (tek tık, presigned link sızmaz)
+GET  /download?id=…          -> resmi uçtan düz MP3, bayt bayt
+```
+
+Presigned S3 linkleri ~5 dk yaşadığı için **TTL'li bellek önbelleği** var:
+pozitif 4 dk, negatif (`not_authorized`) 1 dk. Aynı klip için Suno'ya tekrar gidilmez.
+
+### 23.2 İndirme izni yoksa
+
+```json
+"download": { "ready": false, "reason": "download_not_authorized",
+              "detail": "{\"ok\":false,\"reason\":\"no_permission\"}" }
+```
+
+Dashboard'da buton **soluk/pasif** olur, yanında `indirme izni yok (not_authorized)` yazar.
+Şifreli bayt istemciye gönderilmez (`409 CLIP_ENCRYPTED`).
+
+### 23.3 Ölçümler (yerel + canlı)
+
+| Test | Sonuç |
+|---|---|
+| `/track` (izni olan klip) | `download.ready: true`, `mode: official-api` |
+| `/download?id=` (buton) | `200`, **3 764 184 B**, `audio/mpeg` |
+| Önbellekli 2. `/track` | **146 ms** (Suno'ya gitmiyor) |
+| İzinsiz klip | `ready:false`, `download_not_authorized` |
+
+### 23.4 Bilinen sınır: üretim token tazeliği
+
+`/api/generate/v2-web` **taze** token ister; 15+ dakikalık token'da
+`422 token_validation_failed` döner. İndirme (`/api/download/clip`) ise geçerli
+herhangi bir token'la çalışır. Bu yüzden üretimden hemen önce tokunun taze
+olması gerekir (konsol snippet'i).

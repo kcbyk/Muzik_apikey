@@ -398,6 +398,8 @@
         status: c.status || 'queued',
         duration: c.duration_seconds || null,
         provider: data.provider || 'suno',
+        download_ready: null, // /track ile cozulecek
+        download_reason: null,
         created_at: Date.now(),
       }));
 
@@ -423,9 +425,19 @@
     try {
       const data = await api('/track/' + encodeURIComponent(id));
       const track = data.track || data;
-      updateClip(id, { status: track.status, duration: track.duration_seconds, title: track.title || undefined });
+      const dl = data.download || null;
+      updateClip(id, {
+        status: track.status,
+        duration: track.duration_seconds,
+        title: track.title || undefined,
+        // otomatik indirme durumu (sunucu tamamlaninca cozer)
+        download_ready: Boolean(dl && dl.ready),
+        download_reason: dl && !dl.ready ? dl.reason : null,
+      });
       if (track.status === 'complete' || track.is_error || track.status === 'error') {
-        logLine(`GET /track/${id.slice(0, 8)}`, { status: track.status });
+        logLine(`GET /track/${id.slice(0, 8)}`, { status: track.status, download: dl });
+        // Indirme hazirsa kullaniciya hemen bildir
+        if (dl && dl.ready) toast('Beat hazır — İndir aktif.', 'ok');
         return;
       }
     } catch (err) {
@@ -473,6 +485,7 @@
 
       const dur = c.duration ? `${Math.round(c.duration)} sn` : '—';
       const ready = c.status === 'complete';
+      const canDownload = ready && c.download_ready !== false;
 
       el.innerHTML = `
         <div class="clip-top">
@@ -485,6 +498,7 @@
         ${ready ? '<audio controls preload="none"></audio>' : ''}
         <div class="clip-actions">
           ${ready ? '<a class="btn btn-ghost btn-sm" download>⬇ MP3 indir</a>' : ''}
+          ${ready && c.download_ready === false ? '<span class="hint" data-dlmsg></span>' : ''}
           <button class="btn btn-ghost btn-sm" data-act="refresh">↻ Durum</button>
           <button class="btn btn-ghost btn-sm" data-act="remove">✕ Kaldır</button>
         </div>
@@ -496,11 +510,22 @@
       el.querySelector('.pill').textContent = c.status;
 
       if (ready) {
+        // Otomatik indirme hazirsa dogrudan /download?id= kullanilir (sunucu
+        // resmi indirme ucundan duz MP3 verir). Hazir degilse buton pasif.
         const audio = el.querySelector('audio');
         audio.src = withKey('/stream/' + encodeURIComponent(c.id));
         const a = el.querySelector('a[download]');
-        a.href = withKey('/download?id=' + encodeURIComponent(c.id));
-        a.setAttribute('download', `${(c.title || 'beat').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.mp3`);
+        if (canDownload) {
+          a.href = withKey('/download?id=' + encodeURIComponent(c.id));
+          a.setAttribute('download', `${(c.title || 'beat').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.mp3`);
+        } else {
+          a.removeAttribute('href');
+          a.style.opacity = '0.45';
+          a.style.pointerEvents = 'none';
+          a.title = 'Suno bu klip icin indirme izni vermedi';
+        }
+        const msg = el.querySelector('[data-dlmsg]');
+        if (msg) msg.textContent = 'indirme izni yok (not_authorized)';
       }
 
       el.querySelector('[data-act="refresh"]').onclick = () => pollClip(c.id, 59);
