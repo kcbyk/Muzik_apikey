@@ -3174,6 +3174,18 @@ app.post('/generate-beat', apiKeyGuard, async (req, res) => {
     if (status === 503) {
       return sendError(res, 503, err.code || 'PROVIDER_NOT_CONFIGURED', err.message, err.detail);
     }
+    // Captcha: kullaniciya NE YAPACAGINI soyleyen net mesaj.
+    if (err.code === 'CAPTCHA_REQUIRED') {
+      return sendError(
+        res,
+        428,
+        'CAPTCHA_REQUIRED',
+        'Suno uretim icin captcha dogrulamasi istiyor. ' +
+          '1) SUNO_CAPTCHA_TOKEN (tarayicidan) veya 2) CAPTCHA_SOLVER=capsolver + CAPSOLVER_API_KEY, ' +
+          'ya da 3) AUDIO_PROVIDER=reapi/replicate ile captcha\'siz resmi API.',
+        err.detail,
+      );
+    }
     const isSuno = providerRegistry.getProviderName() === 'suno';
     if (isSuno && (status === 422 || /token_validation_failed/i.test(String(err.detail || '')))) {
       // Suno 422'yi hem "token gecersiz" hem "kredin bitti" icin donduruyor.

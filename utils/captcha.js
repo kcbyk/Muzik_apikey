@@ -49,7 +49,8 @@ const SOLVER_POLL_MS = Number(process.env.CAPTCHA_SOLVER_POLL_MS || 2500);
 /** "0:hcaptcha,1:turnstile" -> { 0:'hcaptcha', 1:'turnstile' } */
 function parseVersionMap(raw) {
   const map = {};
-  String(raw || '1:turnstile,0:hcaptcha')
+  // Suno 20 Eki 2026 itibariyla captcha_version: 2 donduruyor (Turnstile).
+  String(raw || '0:hcaptcha,1:turnstile,2:turnstile')
     .split(',')
     .forEach((pair) => {
       const [k, v] = pair.split(':').map((s) => (s || '').trim());
