@@ -41,6 +41,8 @@ const { SignerPool } = require('./utils/signerPool');
 const { KeyStore } = require('./utils/keyStore');
 const mangoDecrypter = require('./utils/mangoDecrypter');
 const { AccountPool, parseTokensFromEnv, isCreditExhaustedError } = require('./utils/accountPool');
+// Uretim captcha cozumu (/api/c/check + token/token_provider)
+const captcha = require('./utils/captcha');
 
 // ============================================================================
 // 1. KONFIGURASYON
@@ -128,6 +130,14 @@ const CONFIG = {
   // suno_device_id cookie'si. Bos ise asagidaki sabitten otomatik uretilir.
   deviceId: (process.env.SUNO_DEVICE_ID || '').trim(),
   forwardClientCookie: envBool(process.env.FORWARD_CLIENT_COOKIE, true),
+
+  // --- Uretim captcha'si (Suno v6) ---
+  // Kanit: tarayici once POST /api/c/check {ctype} yapar; "required" ise
+  // generate govdesine { token, token_provider } ekler. Proxy bunlari
+  // gondermedigi icin 422 token_validation_failed alinir.
+  captchaEnabled: envBool(process.env.SUNO_CAPTCHA_ENABLED, true),
+  captchaCheckPath: (process.env.SUNO_CAPTCHA_CHECK_PATH || '/api/c/check').trim(),
+  captchaType: (process.env.SUNO_CAPTCHA_CTYPE || 'generation').trim(),
 
   // --- Indirme proxy'si (SSRF korumasi) ---
   // Yalnizca bu host'lardan akis yapilir. "*" KULLANMAYIN.
@@ -2370,6 +2380,28 @@ async function fetchSunoDownloadUrl(clipId, format = 'mp3') {
   return { url: check.url, status, format: fmt };
 }
 
+/**
+ * Suno uretim captcha'si.
+ * ---------------------------------------------------------------------------
+ * Suno v6 ile birlikte /api/generate/v2-web/ istekleri captcha dogrulamasi
+ * istiyor. Tarayici akisi:
+ *
+ *   1) POST /api/c/check  { ctype: "generation" }
+ *        -> { required: true|false, captcha_version: n }
+ *   2) required ise Turnstile/hCaptcha cozulur
+ *   3) generate govdesine { token: "<cozum>", token_provider: n } eklenir
+ *
+ * Bu katman proxy tarafinda ayni akisi kurar. Cozum kaynagi:
+ *   SUNO_CAPTCHA_TOKEN (elle)  ->  CAPTCHA_SOLVER (capsolver/2captcha)  ->  hata
+ */
+async function getSunoCaptchaToken(options = {}) {
+  return captcha.getCaptchaToken({
+    sunoRequest,
+    force: Boolean(options.force),
+    log,
+  });
+}
+
 providerRegistry.providers.suno.init({
   sunoRequest,
   fetchClip,
@@ -2381,6 +2413,8 @@ providerRegistry.providers.suno.init({
   defaultModel: CONFIG.defaultModel,
   defaultInstrumental: CONFIG.defaultInstrumental,
   generatePath: CONFIG.generatePath,
+  captchaType: CONFIG.captchaType,
+  getCaptchaToken: getSunoCaptchaToken,
   hasRefreshToken: Boolean(CONFIG.refreshToken || accountPool.size() > 0),
   hasSessionToken: Boolean(CONFIG.sessionToken),
   accountPool,
@@ -2742,6 +2776,20 @@ app.get('/health', (_req, res) => {
       keyStore: keyStore.stats_(),
     },
     signer: signerStatus(),
+    captcha: {
+      enabled: CONFIG.captchaEnabled,
+      checkPath: CONFIG.captchaCheckPath,
+      ctype: CONFIG.captchaType,
+      solver: captcha.solverName(),
+      manualToken: Boolean(String(process.env.SUNO_CAPTCHA_TOKEN || '').trim()),
+      forcedProvider: String(process.env.SUNO_CAPTCHA_PROVIDER || '').trim() || null,
+      siteKeys: {
+        turnstile: Boolean(captcha.siteKeyFor('turnstile')),
+        hcaptcha: Boolean(captcha.siteKeyFor('hcaptcha')),
+      },
+      note:
+        'Suno v6 uretim icin /api/c/check -> required ise govdeye {token, token_provider} eklenir.',
+    },
     config: {
       sunoApiBase: CONFIG.sunoApiBase,
       generatePath: CONFIG.generatePath,

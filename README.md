@@ -1864,3 +1864,155 @@ Retry yalnızca **gövde tüketilmeden önce** yapılır; bayt kaybı olmaz.
 | 302 → iç ağ (169.254.169.254) | ✅ `403 URL_NOT_ALLOWED` |
 | Allowlist dışı host | ✅ `403` + yol gösteren `detail` |
 | `/track` (Suno, izin yok) | `download {ready:false, reason:"download_not_authorized"}` → buton pasif |
+
+---
+
+## 28. 🎯 422 `token_validation_failed` — GERÇEK sebep: CAPTCHA (çözüldü)
+
+### 28.1 Sorunun yanlış teşhisi
+
+Bölüm 23.4 ve 26.2, 422 hatasını **"eski JWT"** olarak açıklıyordu. Bu yanlıştı.
+Aşağıdaki ölçüm bunu kesin olarak çürütüyor:
+
+| İstek | Yanıt |
+|---|---|
+| Geçersiz/eksik JWT ile `POST /api/generate/v2-web/` | **401** `{"detail":"Unauthorized"}` |
+| Canlı proxy'nin aldığı hata | **422** `{"error_type":"token_validation_failed","detail":"We couldn't verify your request. Please refresh the page and try again."}` |
+
+İki yanıt **tamamen farklı**. Token geçersiz olsaydı 401 gelirdi. 422, kimlik
+doğrulaması **geçtikten sonraki** bir doğrulama adımının reddi demektir.
+`/api/feed/v3` ve `/api/download/clip` aynı token'la sorunsuz çalışıyor —
+yani oturum sağlam, sadece **üretim** ucu reddediyor.
+
+### 28.2 Kanıt: suno.com web bundle'ı
+
+Canlı bundle'da (`_next/static/immutable/chunks/*`) üretim akışı şu:
+
+```js
+// 1) Önce captcha gerekip gerekmediği sorulur
+m = await session.getCaptchaTokenIfRequired("generation");
+
+// 2) Gerekliyse Turnstile/hCaptcha çözülür, sonucu generate'e verilir
+await D({ ..., token: m, tokenProvider: f = m ? session.generationCaptchaVersion : null });
+```
+
+`getCaptchaTokenIfRequired` fonksiyonunun içi:
+
+```js
+getCaptchaTokenIfRequired = async (ctype) => {
+  let required;
+  try {
+    const r = await this.apiClient.POST("/api/c/check", { body: { ctype } });
+    required = r.data?.required;
+    if (ctype === "generation") {
+      const version = r.data?.captcha_version === H._ ? H._ : H.c; // turnstile | hcaptcha
+      ...
+    }
+  } catch (e) {
+    required = true;   // fail-closed
+  }
+  if (required !== true) return null;
+  // widget mount edilir, doğrulama beklenir -> token
+};
+```
+
+Ve nihai istek gövdesi:
+
+```js
+E = {
+  ...,
+  token: e,            // <-- captcha çözümü
+  token_provider: g,   // <-- captcha_version (turnstile/hcaptcha)
+  mv: I, prompt, ...
+}
+```
+
+Bundle'dan çıkarılan anahtarlar:
+
+| Tür | Değer |
+|---|---|
+| Turnstile sitekey | `0x4AAAAAABd64Cd9aq5C--VE`, `0x4AAAAAABtnpJo7aKMs9JLQ`, `0x4AAAAAADI7xDNyj-3LcIbi` |
+| hCaptcha sitekey | `client-DaZjubWc7zwnZ5o2EEJhqt4UYRzYRoUuHbTQcIH9Ybq` |
+| Endpoint | `POST /api/c/check` → `{ required, captcha_version }` |
+
+### 28.3 Kök neden (tek cümle)
+
+Proxy, `/api/c/check` çağrısını hiç yapmıyor ve generate gövdesine
+`token` / `token_provider` alanlarını hiç koymuyordu. Suno da anti-bot
+doğrulaması olmadığı için isteği `422 token_validation_failed` ile reddediyordu.
+Mesaj "token" dediği için **JWT hatası sanıldı**; kodu yenilemek bu yüzden hiç
+işe yaramadı.
+
+### 28.4 Düzeltme
+
+Yeni dosya: **`utils/captcha.js`** — `/api/c/check` ön kontrolü + captcha çözümü.
+Değişen dosyalar: `server.js` (CONFIG + `getSunoCaptchaToken` + `/health.captcha`),
+`providers/suno.js` (gövdeye enjeksiyon + doğru hata sınıflandırması).
+
+Akış artık tarayıcıyla birebir aynı:
+
+```text
+generate()
+  └─ getCaptchaToken()
+       ├─ POST /api/c/check { ctype: "generation" }
+       ├─ required === false  -> token gönderilmez (üretim zaten çalışır)
+       ├─ required === true   -> SUNO_CAPTCHA_TOKEN  (elle)
+       │                      -> CAPTCHA_SOLVER (capsolver | 2captcha)
+       │                      -> yoksa 428 CAPTCHA_REQUIRED (net mesaj)
+       └─ gövdeye { token, token_provider } eklenir
+```
+
+Captcha reddedilirse (çözüm süresi dolmuş) **bir kez** yeniden çözülüp tekrar
+denenir.
+
+### 28.5 Kritik yan düzeltme: havuz zehirlenmesi
+
+Eski `providers/suno.js`, captcha kaynaklı 422'yi "token reddi" sayıp hesabı
+`markAccountExhausted` ile işaretliyordu. Sonuç: iki hesap da 60 sn kilitleniyor,
+`/auth/pool` tüm havuzu "exhausted" gösteriyor ve sorun kota bitmiş gibi
+görünüyordu. Artık captcha reddi hesabı **suçlamıyor**.
+
+### 28.6 Nasıl kurulur
+
+**A) Hızlı test (elle, ~5 dk):**
+```text
+1) suno.com/create > F12 > Network > "generate/v2-web" isteğini bul
+2) Payload içindeki "token" değerini kopyala
+3) Render > Environment > SUNO_CAPTCHA_TOKEN = <değer>
+```
+Kısa ömürlüdür; sadece doğrulama için.
+
+**B) Kalıcı (otomatik çözüm):**
+```text
+CAPTCHA_SOLVER=capsolver
+CAPSOLVER_API_KEY=...
+# veya
+CAPTCHA_SOLVER=2captcha
+TWOCAPTCHA_API_KEY=...
+```
+Her üretimde captcha çözülür; istek başına yaklaşık $0.001–0.003 ek maliyet.
+
+**C) Captcha'sız üretim isteniyorsa** — resmî API'li sağlayıcıya geç:
+```text
+AUDIO_PROVIDER=replicate   + REPLICATE_API_TOKEN=...
+AUDIO_PROVIDER=reapi       + REAPI_API_KEY=...
+AUDIO_PROVIDER=elevenlabs  + ELEVENLABS_API_KEY=...
+```
+İstemci kodunda değişiklik gerekmez (Bölüm 24.6).
+
+### 28.7 Teşhis aracı
+
+```bash
+SUNO_REFRESH_TOKEN='__client değeri' node tools/diagnose-captcha.js
+```
+
+Çıktı: taze JWT üretimi → `/api/c/check` sonucu → captcha'sız generate denemesi
+→ yorum. "CAPTCHA ZORUNLU" derse kök neden doğrulanmış demektir.
+
+### 28.8 Testler
+
+```bash
+node tests/captcha.test.js
+```
+`/api/c/check` yanıtları, sürüm→sağlayıcı eşlemesi, gövdeye enjeksiyon,
+`CAPTCHA_REQUIRED` fırlatma ve "422'de hesabı işaretlememe" davranışını kapsar.
