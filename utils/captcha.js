@@ -61,6 +61,38 @@ function parseVersionMap(raw) {
 
 const VERSION_MAP = parseVersionMap(process.env.SUNO_CAPTCHA_VERSION_MAP);
 
+/* ---------------------------------------------------------------------------
+ * Calisma zamaninda elle verilen cozum (POST /auth/captcha-token)
+ * Turnstile/hCaptcha cozumleri tek kullanimlik ve ~2-5 dk omurludur.
+ * ------------------------------------------------------------------------- */
+let runtimeToken = null; // { token, provider, expiresAt, source }
+
+function setRuntimeToken(token, provider = null, ttlSeconds = 300) {
+  const clean = String(token || '').trim();
+  if (!clean) throw new Error('token bos olamaz');
+  const ttl = Math.max(10, Math.min(3600, Number(ttlSeconds) || 300));
+  runtimeToken = {
+    token: clean,
+    provider,
+    expiresAt: Date.now() + ttl * 1000,
+    source: 'runtime',
+  };
+  return { ...runtimeToken, token: `${clean.slice(0, 8)}...` };
+}
+
+function getRuntimeToken() {
+  if (!runtimeToken) return null;
+  if (Date.now() >= runtimeToken.expiresAt) {
+    runtimeToken = null;
+    return null;
+  }
+  return runtimeToken;
+}
+
+function clearRuntimeToken() {
+  runtimeToken = null;
+}
+
 /** Yapilandirilmis cozum servisi var mi? */
 function solverName() {
   const forced = String(process.env.CAPTCHA_SOLVER || '').trim().toLowerCase();
@@ -225,7 +257,9 @@ async function getCaptchaToken({ sunoRequest, force = false, log } = {}) {
   const ctype = String(process.env.SUNO_CAPTCHA_CTYPE || 'generation').trim();
   const enabled = String(process.env.SUNO_CAPTCHA_ENABLED || 'true').toLowerCase() !== 'false';
 
-  const manual = String(process.env.SUNO_CAPTCHA_TOKEN || '').trim();
+  const runtime = getRuntimeToken();
+  const manual = runtime ? runtime.token : String(process.env.SUNO_CAPTCHA_TOKEN || '').trim();
+  const manualProvider = runtime ? runtime.provider : null;
   if (!enabled) {
     return { required: false, token: manual || null, provider: null, source: manual ? 'env' : 'disabled' };
   }
@@ -248,9 +282,14 @@ async function getCaptchaToken({ sunoRequest, force = false, log } = {}) {
     return { required: false, token: manual || null, provider: null, source: manual ? 'env' : 'not-required' };
   }
 
-  // 2) Elle verilmis cozum
+  // 2) Elle verilmis cozum (once runtime, sonra env)
   if (manual) {
-    return { required: true, token: manual, provider: version, source: 'env' };
+    return {
+      required: true,
+      token: manual,
+      provider: manualProvider !== null && manualProvider !== undefined ? manualProvider : version,
+      source: runtime ? 'runtime' : 'env',
+    };
   }
 
   // 3) Otomatik cozum
@@ -279,6 +318,9 @@ async function getCaptchaToken({ sunoRequest, force = false, log } = {}) {
 
 module.exports = {
   getCaptchaToken,
+  setRuntimeToken,
+  getRuntimeToken,
+  clearRuntimeToken,
   solverName,
   siteKeyFor,
   DEFAULT_SITEKEYS,

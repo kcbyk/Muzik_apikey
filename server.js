@@ -2782,6 +2782,7 @@ app.get('/health', (_req, res) => {
       ctype: CONFIG.captchaType,
       solver: captcha.solverName(),
       manualToken: Boolean(String(process.env.SUNO_CAPTCHA_TOKEN || '').trim()),
+      runtimeToken: Boolean(captcha.getRuntimeToken()),
       forcedProvider: String(process.env.SUNO_CAPTCHA_PROVIDER || '').trim() || null,
       siteKeys: {
         turnstile: Boolean(captcha.siteKeyFor('turnstile')),
@@ -2810,6 +2811,32 @@ app.get('/auth/pool', apiKeyGuard, (_req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /auth/captcha-token -> Tarayicidan alinan captcha cozumunu runtime'a ver
+// ---------------------------------------------------------------------------
+// Govde: { "token": "...", "provider": 2, "ttl_seconds": 300 }
+// Turnstile/hCaptcha cozumleri tek kullanimlik ve ~2-5 dk omurludur; bu uc
+// sayesinde redeploy GEREKMEDEN yeni cozum verilebilir.
+app.post('/auth/captcha-token', apiKeyGuard, express.json({ limit: '32kb' }), (req, res) => {
+  const body = req.body || {};
+  try {
+    const info = captcha.setRuntimeToken(body.token, body.provider ?? body.token_provider, body.ttl_seconds);
+    log('info', '[captcha] Runtime token ayarlandi.', { ttl: body.ttl_seconds || 300 });
+    res.json({
+      ok: true,
+      message: 'Captcha cozumu runtime\'a alindi. Siradaki /generate-beat bunu kullanacak.',
+      saved: info,
+    });
+  } catch (err) {
+    sendError(res, 400, 'INVALID_CAPTCHA_TOKEN', err.message);
+  }
+});
+
+app.delete('/auth/captcha-token', apiKeyGuard, (_req, res) => {
+  captcha.clearRuntimeToken();
+  res.json({ ok: true, message: 'Runtime captcha cozumu temizlendi.' });
+});
+
+// ---------------------------------------------------------------------------
 // GET /auth/captcha-check -> Suno bu hesap icin uretim captcha'si istiyor mu?
 // ---------------------------------------------------------------------------
 // Teshis icin: canli ortamda token'in gecerli oldugunu ve captcha gerekliligini
@@ -2823,6 +2850,7 @@ app.get('/auth/captcha-check', apiKeyGuard, async (_req, res) => {
         required: info.required,
         token_available: Boolean(info.token),
         source: info.source,
+        runtime_token_active: Boolean(captcha.getRuntimeToken()),
         preferred_provider: info.preferred || null,
         token_provider: info.provider,
       },
