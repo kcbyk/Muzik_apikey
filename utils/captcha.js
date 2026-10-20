@@ -39,7 +39,11 @@ const axios = require('axios');
  * Suno'nun bundle'indan cikarilan site anahtarlari
  * ------------------------------------------------------------------------- */
 const DEFAULT_SITEKEYS = {
-  turnstile: ['0x4AAAAAABd64Cd9aq5C--VE', '0x4AAAAAABtnpJo7aKMs9JLQ', '0x4AAAAAADI7xDNyj-3LcIbi'],
+  // 0x4AAAAAADI7xDNyj-3LcIbi = NEXT_PUBLIC_CLOUDFLARE_TURNSTILE_SITE_KEY_GEN
+  //   (suno.com bundle'i: SITE_KEY_GEN = "uretim" captcha'si -> dogru olan bu)
+  // 0x4AAAAAABd64Cd9aq5C--VE = genel SITE_KEY
+  // 0x4AAAAAABtnpJo7aKMs9JLQ = SITE_KEY_AUTH (giris)
+  turnstile: ['0x4AAAAAADI7xDNyj-3LcIbi', '0x4AAAAAABd64Cd9aq5C--VE', '0x4AAAAAABtnpJo7aKMs9JLQ'],
   hcaptcha: ['client-DaZjubWc7zwnZ5o2EEJhqt4UYRzYRoUuHbTQcIH9Ybq'],
 };
 
@@ -96,9 +100,11 @@ function clearRuntimeToken() {
 /** Yapilandirilmis cozum servisi var mi? */
 function solverName() {
   const forced = String(process.env.CAPTCHA_SOLVER || '').trim().toLowerCase();
+  if (forced === 'peak' || forced === 'peakfo' || forced === 'peak.fo') return 'peak';
   if (forced === 'capsolver' || forced === '2captcha') return forced;
   if (forced === 'none' || forced === 'off' || forced === '') {
-    // otomatik algila
+    // otomatik algila (peak oncelikli: en hizli + en ekonomik)
+    if (String(process.env.PEAK_API_KEY || '').trim()) return 'peak';
     if (String(process.env.CAPSOLVER_API_KEY || '').trim()) return 'capsolver';
     if (String(process.env.TWOCAPTCHA_API_KEY || '').trim()) return '2captcha';
   }
@@ -167,6 +173,76 @@ async function solveWithCapSolver(provider, sitekey) {
   throw new Error('CapSolver zaman asimi');
 }
 
+/* ---------------------------------------------------------------------------
+ * peak.fo — Cloudflare Turnstile / 5s challenge cozucu
+ * ---------------------------------------------------------------------------
+ * POST https://api.peak.fo/solve
+ *   { task_type: "TurnstileTaskProxyLess" | "turnstiletask", sitekey, url, proxy }
+ *   -> { success: true, data: { token: "0.xxx" } }
+ * Auth: X-API-Key: pk_...
+ * Bakiye: GET https://api.peak.fo/balance
+ * Sadece basarili cozumler faturalanir.
+ * ------------------------------------------------------------------------- */
+async function solveWithPeak(provider, sitekey) {
+  const apiKey = String(process.env.PEAK_API_KEY || '').trim();
+  if (!apiKey) throw new Error('PEAK_API_KEY bos');
+
+  const base = String(process.env.PEAK_BASE_URL || 'https://api.peak.fo').replace(/\/+$/, '');
+  const target = pageUrl();
+
+  // Docs: url TRAILING SLASH ile bitmeli
+  const url = target.endsWith('/') ? target : `${target}/`;
+
+  // hCaptcha peak'te yok -> sadece turnstile
+  if (provider !== 'turnstile') {
+    throw new Error(`peak.fo ${provider} desteklemiyor (yalnizca turnstile)`);
+  }
+
+  const proxy = String(process.env.PEAK_PROXY || '').trim();
+  const body = {
+    task_type: proxy ? 'turnstiletask' : 'TurnstileTaskProxyLess',
+    sitekey,
+    url,
+  };
+  if (proxy) body.proxy = proxy;
+
+  const action = String(process.env.SUNO_TURNSTILE_ACTION || '').trim();
+  if (action) body.action = action;
+  const cdata = String(process.env.SUNO_TURNSTILE_CDATA || '').trim();
+  if (cdata) body.cdata = cdata;
+
+  const res = await axios.post(`${base}/solve`, body, {
+    timeout: SOLVER_TIMEOUT_MS,
+    validateStatus: () => true,
+    headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
+  });
+
+  const d = res.data || {};
+  if (res.status !== 200 || d.success !== true) {
+    throw new Error(`peak.fo ${res.status}: ${JSON.stringify(d).slice(0, 300)}`);
+  }
+  const token = d.data && d.data.token;
+  if (!token) throw new Error('peak.fo token dondurmedi');
+  return token;
+}
+
+/** peak.fo bakiye sorgusu (teshis icin). */
+async function peakBalance() {
+  const apiKey = String(process.env.PEAK_API_KEY || '').trim();
+  if (!apiKey) return null;
+  const base = String(process.env.PEAK_BASE_URL || 'https://api.peak.fo').replace(/\/+$/, '');
+  try {
+    const res = await axios.get(`${base}/balance`, {
+      timeout: 20000,
+      validateStatus: () => true,
+      headers: { 'X-API-Key': apiKey },
+    });
+    return res.data || null;
+  } catch (_e) {
+    return null;
+  }
+}
+
 async function solveWith2Captcha(provider, sitekey) {
   const key = String(process.env.TWOCAPTCHA_API_KEY || '').trim();
   if (!key) throw new Error('TWOCAPTCHA_API_KEY bos');
@@ -228,8 +304,10 @@ async function solve(provider, log) {
     if (!sitekey) continue;
     try {
       if (log) log('info', `[captcha] ${solver} ile ${p} cozuluyor...`, { sitekey });
-      const token =
-        solver === 'capsolver' ? await solveWithCapSolver(p, sitekey) : await solveWith2Captcha(p, sitekey);
+      let token;
+      if (solver === 'peak') token = await solveWithPeak(p, sitekey);
+      else if (solver === 'capsolver') token = await solveWithCapSolver(p, sitekey);
+      else token = await solveWith2Captcha(p, sitekey);
       if (log) log('info', `[captcha] ${p} cozuldu (${String(token).length} karakter).`);
       return { token, provider: p, sitekey };
     } catch (err) {
@@ -318,6 +396,7 @@ async function getCaptchaToken({ sunoRequest, force = false, log } = {}) {
 
 module.exports = {
   getCaptchaToken,
+  peakBalance,
   setRuntimeToken,
   getRuntimeToken,
   clearRuntimeToken,
