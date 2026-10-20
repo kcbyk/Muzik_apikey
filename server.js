@@ -2810,6 +2810,39 @@ app.get('/auth/pool', apiKeyGuard, (_req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /auth/captcha-check -> Suno bu hesap icin uretim captcha'si istiyor mu?
+// ---------------------------------------------------------------------------
+// Teshis icin: canli ortamda token'in gecerli oldugunu ve captcha gerekliligini
+// tek cagrida gosterir. Uretim yapmaz, kredi harcamaz.
+app.get('/auth/captcha-check', apiKeyGuard, async (_req, res) => {
+  try {
+    const info = await getSunoCaptchaToken({ force: true });
+    res.json({
+      ok: true,
+      captcha: {
+        required: info.required,
+        token_available: Boolean(info.token),
+        source: info.source,
+        preferred_provider: info.preferred || null,
+        token_provider: info.provider,
+      },
+      hint: info.required
+        ? 'Suno bu hesap icin captcha istiyor. SUNO_CAPTCHA_TOKEN veya CAPTCHA_SOLVER tanimlayin.'
+        : 'Captcha gerekmiyor; uretim dogrudan calismali.',
+    });
+  } catch (err) {
+    res.status(502).json({
+      ok: false,
+      error: {
+        code: 'CAPTCHA_CHECK_FAILED',
+        message: err.message,
+        detail: err.detail ? String(err.detail).slice(0, 500) : undefined,
+      },
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /auth/reset-limits -> Tukenmis tum hesaplarin limit durumlarini elle sifirla
 // ---------------------------------------------------------------------------
 app.post('/auth/reset-limits', apiKeyGuard, (_req, res) => {
