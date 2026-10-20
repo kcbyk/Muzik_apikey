@@ -104,7 +104,7 @@ function solverName() {
   if (forced === 'capsolver' || forced === '2captcha') return forced;
   if (forced === 'none' || forced === 'off' || forced === '') {
     // otomatik algila (peak oncelikli: en hizli + en ekonomik)
-    if (String(process.env.PEAK_API_KEY || '').trim()) return 'peak';
+    if (peakKeys().length > 0) return 'peak';
     if (String(process.env.CAPSOLVER_API_KEY || '').trim()) return 'capsolver';
     if (String(process.env.TWOCAPTCHA_API_KEY || '').trim()) return '2captcha';
   }
@@ -174,26 +174,87 @@ async function solveWithCapSolver(provider, sitekey) {
 }
 
 /* ---------------------------------------------------------------------------
- * peak.fo — Cloudflare Turnstile / 5s challenge cozucu
+ * peak.fo — Cloudflare Turnstile cozucusu (COKLU ANAHTAR DESTEKLI)
  * ---------------------------------------------------------------------------
  * POST https://api.peak.fo/solve
- *   { task_type: "TurnstileTaskProxyLess" | "turnstiletask", sitekey, url, proxy }
+ *   { task_type: "TurnstileTaskProxyLess", sitekey, url }
  *   -> { success: true, data: { token: "0.xxx" } }
  * Auth: X-API-Key: pk_...
- * Bakiye: GET https://api.peak.fo/balance
- * Sadece basarili cozumler faturalanir.
+ *
+ * ANAHTAR EKLEME (virgul / yeni satir / noktali virgul ile):
+ *   PEAK_API_KEYS=pk_aaa,pk_bbb,pk_ccc
+ *   PEAK_API_KEY=pk_aaa          (tek anahtar icin geriye uyumlu)
+ *   PEAK_API_KEY_1=pk_aaa        (numarali varyant, _2 .. _10)
+ *
+ * Anahtar sirasiyla denenir: bakiye bitmis / gecersiz / hata veren anahtar
+ * atlanip bir sonrakine gecilir. Hepsi biterse son hata firlatilir.
  * ------------------------------------------------------------------------- */
-async function solveWithPeak(provider, sitekey) {
-  const apiKey = String(process.env.PEAK_API_KEY || '').trim();
-  if (!apiKey) throw new Error('PEAK_API_KEY bos');
 
+/** Ham metni anahtar listesine cevirir (virgul, noktali virgul, yeni satir). */
+function parseKeyList(raw) {
+  return String(raw || '')
+    .split(/[\s,;]+/)
+    .map((k) => k.trim())
+    .filter(Boolean);
+}
+
+/** Tanimli tum peak anahtarlari (tekrarsiz, sira korunur). */
+function peakKeys() {
+  const out = [];
+  const push = (v) => {
+    for (const k of parseKeyList(v)) if (!out.includes(k)) out.push(k);
+  };
+  push(process.env.PEAK_API_KEYS);
+  push(process.env.PEAK_API_KEY);
+  for (let i = 1; i <= 10; i += 1) push(process.env[`PEAK_API_KEY_${i}`]);
+  return out;
+}
+
+/** Loglarda anahtari maskele: pk_dc14...e361a */
+function maskKey(k) {
+  const s = String(k || '');
+  if (s.length <= 12) return `${s.slice(0, 4)}...`;
+  return `${s.slice(0, 8)}...${s.slice(-4)}`;
+}
+
+/** Anahtar basi durum (teshis icin). */
+const peakKeyState = new Map(); // key -> { failures, lastError, lastUsedAt, exhaustedUntil }
+
+/** Anahtar durumlarini (sogutma/sayac) sifirla. */
+function resetPeakState() {
+  peakKeyState.clear();
+}
+
+function peakKeyStatus() {
+  return peakKeys().map((k, i) => {
+    const st = peakKeyState.get(k) || {};
+    return {
+      index: i,
+      key: maskKey(k),
+      failures: st.failures || 0,
+      lastError: st.lastError || null,
+      lastUsedAt: st.lastUsedAt ? new Date(st.lastUsedAt).toISOString() : null,
+      coolingDown: Boolean(st.cooldownUntil && Date.now() < st.cooldownUntil),
+    };
+  });
+}
+
+/** Bakiye/anahtar hatasi mi? (diger anahtara gec) */
+function isKeyLevelFailure(status, data) {
+  if (status === 401 || status === 403 || status === 402) return true;
+  const txt = JSON.stringify(data || {}).toLowerCase();
+  return /insufficient|balance|quota|unauthorized|invalid api key|exceeded/.test(txt);
+}
+
+/**
+ * Tek anahtarla cozum dener.
+ * @returns {Promise<{token:string}>}
+ */
+async function peakSolveOnce(apiKey, provider, sitekey, log) {
   const base = String(process.env.PEAK_BASE_URL || 'https://api.peak.fo').replace(/\/+$/, '');
   const target = pageUrl();
-
-  // Docs: url TRAILING SLASH ile bitmeli
   const url = target.endsWith('/') ? target : `${target}/`;
 
-  // hCaptcha peak'te yok -> sadece turnstile
   if (provider !== 'turnstile') {
     throw new Error(`peak.fo ${provider} desteklemiyor (yalnizca turnstile)`);
   }
@@ -219,28 +280,86 @@ async function solveWithPeak(provider, sitekey) {
 
   const d = res.data || {};
   if (res.status !== 200 || d.success !== true) {
-    throw new Error(`peak.fo ${res.status}: ${JSON.stringify(d).slice(0, 300)}`);
+    const err = new Error(`peak.fo ${res.status}: ${JSON.stringify(d).slice(0, 200)}`);
+    err.status = res.status;
+    err.keyLevel = isKeyLevelFailure(res.status, d);
+    throw err;
   }
   const token = d.data && d.data.token;
   if (!token) throw new Error('peak.fo token dondurmedi');
-  return token;
+  return { token };
 }
 
-/** peak.fo bakiye sorgusu (teshis icin). */
-async function peakBalance() {
-  const apiKey = String(process.env.PEAK_API_KEY || '').trim();
-  if (!apiKey) return null;
-  const base = String(process.env.PEAK_BASE_URL || 'https://api.peak.fo').replace(/\/+$/, '');
-  try {
-    const res = await axios.get(`${base}/balance`, {
-      timeout: 20000,
-      validateStatus: () => true,
-      headers: { 'X-API-Key': apiKey },
+/** Coklu anahtar: sirayla dene, key-level hatada sonrakine gec. */
+async function solveWithPeak(provider, sitekey, log) {
+  const keys = peakKeys();
+  if (!keys.length) throw new Error('PEAK_API_KEY(S) bos');
+
+  const errors = [];
+  // Sogumada olmayanlari one al
+  const ordered = keys
+    .map((k, i) => ({ k, i }))
+    .sort((a, b) => {
+      const ca = peakKeyState.get(a.k)?.cooldownUntil || 0;
+      const cb = peakKeyState.get(b.k)?.cooldownUntil || 0;
+      const na = ca > Date.now() ? 1 : 0;
+      const nb = cb > Date.now() ? 1 : 0;
+      return na - nb || a.i - b.i;
     });
-    return res.data || null;
-  } catch (_e) {
-    return null;
+
+  for (let n = 0; n < ordered.length; n += 1) {
+    const { k, i } = ordered[n];
+    try {
+      if (log) log('info', `[captcha] peak anahtar #${i + 1}/${keys.length} (${maskKey(k)}) deneniyor...`);
+      const { token } = await peakSolveOnce(k, provider, sitekey, log);
+      const st = peakKeyState.get(k) || {};
+      peakKeyState.set(k, { ...st, failures: 0, lastError: null, lastUsedAt: Date.now(), cooldownUntil: 0 });
+      if (log) log('info', `[captcha] peak anahtar #${i + 1} basarili.`);
+      return token;
+    } catch (err) {
+      const st = peakKeyState.get(k) || {};
+      peakKeyState.set(k, {
+        ...st,
+        failures: (st.failures || 0) + 1,
+        lastError: err.message,
+        lastUsedAt: Date.now(),
+        // key-level hatada 90 sn sogut, ag hatasinda 15 sn
+        cooldownUntil: Date.now() + (err.keyLevel ? 90000 : 15000),
+      });
+      errors.push(`#${i + 1} ${maskKey(k)}: ${err.message}`);
+      if (log) log('warn', `[captcha] peak anahtar #${i + 1} basarisiz: ${err.message}`);
+      if (!err.keyLevel) continue; // ag hatasi -> digerini de dene
+    }
   }
+
+  throw new Error(`peak.fo: ${keys.length} anahtarin hepsi basarisiz -> ${errors.join(' | ')}`);
+}
+
+/** peak.fo bakiye sorgusu — TUM anahtarlar icin. */
+async function peakBalance(log) {
+  const keys = peakKeys();
+  if (!keys.length) return null;
+  const base = String(process.env.PEAK_BASE_URL || 'https://api.peak.fo').replace(/\/+$/, '');
+  const out = [];
+  let total = 0;
+  for (let i = 0; i < keys.length; i += 1) {
+    const k = keys[i];
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const res = await axios.get(`${base}/balance`, {
+        timeout: 20000,
+        validateStatus: () => true,
+        headers: { 'X-API-Key': k },
+      });
+      const d = res.data || {};
+      const bal = d.data && typeof d.data.balance === 'number' ? d.data.balance : null;
+      if (bal !== null) total += bal;
+      out.push({ index: i, key: maskKey(k), ok: d.success === true, data: d.data || null });
+    } catch (err) {
+      out.push({ index: i, key: maskKey(k), ok: false, error: err.message });
+    }
+  }
+  return { count: keys.length, total_balance: Number(total.toFixed(4)), keys: out };
 }
 
 async function solveWith2Captcha(provider, sitekey) {
@@ -305,7 +424,7 @@ async function solve(provider, log) {
     try {
       if (log) log('info', `[captcha] ${solver} ile ${p} cozuluyor...`, { sitekey });
       let token;
-      if (solver === 'peak') token = await solveWithPeak(p, sitekey);
+      if (solver === 'peak') token = await solveWithPeak(p, sitekey, log);
       else if (solver === 'capsolver') token = await solveWithCapSolver(p, sitekey);
       else token = await solveWith2Captcha(p, sitekey);
       if (log) log('info', `[captcha] ${p} cozuldu (${String(token).length} karakter).`);
@@ -397,6 +516,11 @@ async function getCaptchaToken({ sunoRequest, force = false, log } = {}) {
 module.exports = {
   getCaptchaToken,
   peakBalance,
+  peakKeys,
+  peakKeyStatus,
+  resetPeakState,
+  parseKeyList,
+  maskKey,
   setRuntimeToken,
   getRuntimeToken,
   clearRuntimeToken,

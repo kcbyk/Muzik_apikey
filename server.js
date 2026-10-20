@@ -2783,7 +2783,9 @@ app.get('/health', (_req, res) => {
       solver: captcha.solverName(),
       manualToken: Boolean(String(process.env.SUNO_CAPTCHA_TOKEN || '').trim()),
       runtimeToken: Boolean(captcha.getRuntimeToken()),
-      peakConfigured: Boolean(String(process.env.PEAK_API_KEY || '').trim()),
+      peakConfigured: captcha.peakKeys().length > 0,
+      peakKeyCount: captcha.peakKeys().length,
+      peakKeys: captcha.peakKeyStatus(),
       forcedProvider: String(process.env.SUNO_CAPTCHA_PROVIDER || '').trim() || null,
       siteKeys: {
         turnstile: Boolean(captcha.siteKeyFor('turnstile')),
@@ -2856,6 +2858,7 @@ app.get('/auth/captcha-check', apiKeyGuard, async (_req, res) => {
         token_provider: info.provider,
       },
       solver: captcha.solverName(),
+      peak_key_count: captcha.peakKeys().length,
       peak_balance: await captcha.peakBalance(),
       hint: info.required
         ? 'Suno bu hesap icin captcha istiyor. CAPTCHA_SOLVER=peak + PEAK_API_KEY (otomatik) veya SUNO_CAPTCHA_TOKEN (elle).'

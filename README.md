@@ -2016,3 +2016,96 @@ node tests/captcha.test.js
 ```
 `/api/c/check` yanıtları, sürüm→sağlayıcı eşlemesi, gövdeye enjeksiyon,
 `CAPTCHA_REQUIRED` fırlatma ve "422'de hesabı işaretlememe" davranışını kapsar.
+
+---
+
+## 29. 🔑 Çoklu API anahtarı — kaç tane istersen, virgülle
+
+### 29.1 peak.fo anahtarları (`PEAK_API_KEYS`)
+
+**Evet, virgülle.** Üç format da çalışır:
+
+```text
+# A) Önerilen — tek satır, virgüllü (sınırsız sayıda)
+PEAK_API_KEYS=pk_aaa,pk_bbb,pk_ccc,pk_ddd
+
+# B) Geriye uyumlu tekil
+PEAK_API_KEY=pk_aaa
+
+# C) Numaralı (1..10)
+PEAK_API_KEY_1=pk_aaa
+PEAK_API_KEY_2=pk_bbb
+```
+
+Ayırıcı olarak virgül, boşluk, noktalı virgül ve yeni satır kabul edilir;
+tekrarlar otomatik temizlenir, **sıra korunur**.
+
+### 29.2 Nasıl davranıyor
+
+| Durum | Davranış |
+|---|---|
+| 1. anahtar çalışıyor | Diğerlerine **hiç gidilmez** (tek çağrı) |
+| 1. anahtar `401/402/403` | Atla, 2. anahtara geç |
+| 1. anahtar `insufficient balance` | Atla, sonrakine geç |
+| Ağ hatası / timeout | Atla, sonrakine geç |
+| Hata veren anahtar | **90 sn soğumaya** alınır, o sırada en sona atılır |
+| Hepsi başarısız | Hata mesajı **tüm anahtarları ve sebeplerini** listeler |
+
+Loglarda anahtarlar maskelenir: `pk_dc145...361a` — asla tam değer yazılmaz.
+
+### 29.3 Canlı doğrulama
+
+Bozuk + gerçek anahtar birlikte:
+
+```
+[captcha] peak anahtar #1/2 (pk_bozuk..._000) deneniyor...
+[warn]    peak anahtar #1 basarisiz: peak.fo 401: {"error":"invalid API key"}
+[captcha] peak anahtar #2/2 (pk_dc145...361a) deneniyor...
+[captcha] peak anahtar #2 basarili.
+SONUC: token ALINDI (794 karakter) | 4141 ms
+```
+
+### 29.4 Durum takibi
+
+```bash
+curl -H "x-api-key: $KEY" https://muzik-apikey.onrender.com/auth/captcha-check
+```
+
+```json
+{
+  "peak_key_count": 3,
+  "peak_balance": {
+    "count": 3,
+    "total_balance": 4.65,
+    "keys": [
+      { "index": 0, "key": "pk_dc145...361a", "ok": true, "data": { "balance": 1.5 } },
+      { "index": 1, "key": "pk_aaa11...bbb2", "ok": true, "data": { "balance": 2.25 } },
+      { "index": 2, "key": "pk_ccc33...ddd4", "ok": true, "data": { "balance": 0.9 } }
+    ]
+  }
+}
+```
+
+`/health.captcha` içinde de `peakKeyCount` + `peakKeys[]` var (maskeleme,
+`failures`, `lastError`, `coolingDown`).
+
+### 29.5 Diğer çoklu anahtar alanları
+
+| Değişken | Ayırıcı | Not |
+|---|---|---|
+| `PEAK_API_KEYS` | virgül | sınırsız, sıralı failover |
+| `SUNO_REFRESH_TOKEN(S)` | virgül / yeni satır / JSON dizi | hesap havuzu (`accountPool`) |
+| `SUNO_REFRESH_TOKEN_1..20` | virgül | numaralı hesap varyantı |
+| `ALLOWED_API_KEYS` | virgül | kendi servisine erişim anahtarları |
+| `CAPSOLVER_API_KEY` / `TWOCAPTCHA_API_KEY` | — | tek anahtar (peak önerilir) |
+
+### 29.6 Test
+
+```bash
+node tests/peak-keys.test.js     # 15/15
+node tests/captcha.test.js       # 10/10
+```
+
+Kapsam: ayrıştırma, tekrarsızlaştırma, sıralı deneme, 401/402 failover,
+ağ hatası failover, hepsi-başarısız hatası, soğutma sırası, bakiye toplama,
+log maskeleme.
